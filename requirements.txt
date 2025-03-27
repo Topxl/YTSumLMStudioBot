@@ -1,0 +1,5 @@
+python-telegram-bot==20.8
+gtts
+python-dotenv
+youtube-transcript-api
+requests
