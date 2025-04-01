@@ -15,7 +15,6 @@ Un bot Telegram intelligent qui résume les vidéos YouTube et répond à vos qu
 ## Prérequis
 
 - Python 3.8+
-- Docker et Docker Compose
 - Un token Telegram Bot (obtenu via [@BotFather](https://t.me/botfather))
 - Une instance LM Studio en cours d'exécution
 
@@ -24,7 +23,7 @@ Un bot Telegram intelligent qui résume les vidéos YouTube et répond à vos qu
 1. Clonez le dépôt :
 ```bash
 git clone https://github.com/Topxl/YTSumLMStudioBot
-cd youtube_bot
+cd YTSumLMStudioBot
 ```
 
 2. Créez un fichier `.env` basé sur `.env.example` :
@@ -34,7 +33,35 @@ cp .env.example .env
 
 3. Configurez les variables d'environnement dans le fichier `.env`
 
-4. Lancez le bot avec Docker :
+## Lancement du bot
+
+### Méthode 1 : Script de lancement (recommandé)
+
+**Sur Linux/macOS :**
+```bash
+chmod +x run.sh  # Rendre le script exécutable (première fois uniquement)
+./run.sh
+```
+
+**Sur Windows :**
+```
+Double-cliquez sur run.bat
+```
+
+### Méthode 2 : Lancement manuel
+
+1. Installez les dépendances :
+```bash
+pip install -r requirements.txt
+```
+
+2. Lancez le bot :
+```bash
+python bot.py
+```
+
+### Méthode 3 : Avec Docker (optionnel)
+
 ```bash
 docker-compose up --build
 ```
@@ -44,7 +71,7 @@ docker-compose up --build
 Le bot nécessite les variables d'environnement suivantes dans le fichier `.env` :
 
 - `TELEGRAM_BOT_TOKEN` : Token de votre bot Telegram
-- `LM_API_URL` : URL de votre instance LM Studio
+- `LM_API_URL` : URL de votre instance LM Studio (ex: http://localhost:1234)
 - `LM_MODEL_NAME` : Nom du modèle à utiliser
 
 ## Utilisation
@@ -83,9 +110,12 @@ Le bot nécessite les variables d'environnement suivantes dans le fichier `.env`
 youtube_bot/
 ├── bot.py              # Code principal du bot
 ├── requirements.txt    # Dépendances Python
-├── docker-compose.yml  # Configuration Docker
-├── .env.example       # Exemple de configuration
-└── README.md          # Documentation
+├── run.sh              # Script de lancement pour Linux/macOS
+├── run.bat             # Script de lancement pour Windows
+├── docker-compose.yml  # Configuration Docker (optionnel)
+├── Dockerfile          # Configuration Docker (optionnel)
+├── .env.example        # Exemple de configuration
+└── README.md           # Documentation
 ```
 
 ## Contribution
