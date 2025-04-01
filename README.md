@@ -8,7 +8,7 @@ Un bot Telegram intelligent qui résume les vidéos YouTube et répond à vos qu
 - 🎙️ Conversion des résumés en audio
 - ❓ Réponses aux questions sur le contenu des vidéos
 - 🔄 Support multilingue (traduction automatique des sous-titres)
-- 🎯 Mode de chat interactif
+- 🎯 Mode de chat interactif (libre ou guidé)
 - 📊 Historique des conversations
 - 🔔 Notifications pour les nouvelles vidéos des chaînes suivies
 
@@ -73,36 +73,51 @@ Le bot nécessite les variables d'environnement suivantes dans le fichier `.env`
 - `TELEGRAM_BOT_TOKEN` : Token de votre bot Telegram
 - `LM_API_URL` : URL de votre instance LM Studio (ex: http://localhost:1234)
 - `LM_MODEL_NAME` : Nom du modèle à utiliser
+- `YOUTUBE_API_KEY` : (Optionnel) Clé API YouTube pour les abonnements
 
 ## Utilisation
 
-### Commandes disponibles
+### Commandes principales
 
-- `/start` - Démarrer le bot
-- `/help` - Afficher l'aide
-- `/chat` - Activer le mode chat
-- `/chat_mode` - Changer le mode de chat
-- `/reset` - Réinitialiser l'historique de conversation
-- `/subscribe` - S'abonner à une chaîne YouTube
-- `/unsubscribe` - Se désabonner d'une chaîne
-- `/list_subscriptions` - Afficher les abonnements
-- `/question` - Poser une question sur une vidéo
+| Commande longue | Raccourci | Description |
+|----------------|-----------|-------------|
+| `/start` | - | Démarrer le bot |
+| `/help` | `/h` | Afficher l'aide |
+| `/question` | `/q` | Poser une question sur une vidéo |
+| `/chat` | `/c` | Activer le mode conversation |
+| `/chat_mode` | `/mode` | Changer le mode de conversation |
+| `/reset` | `/r` | Réinitialiser l'historique |
+| `/subscribe` | `/sub` | S'abonner à une chaîne YouTube |
+| `/unsubscribe` | `/unsub` | Se désabonner d'une chaîne |
+| `/list_subscriptions` | `/list` ou `/subs` | Afficher les abonnements |
 
 ### Exemples d'utilisation
 
 1. **Résumé de vidéo** :
    Envoyez simplement le lien d'une vidéo YouTube au bot.
 
-2. **Question sur une vidéo** :
+2. **Question sur une vidéo** (nouvelle version simplifiée) :
    ```
-   /question https://youtube.com/watch?v=VIDEO_ID ? Quelle est la conclusion principale ?
+   /q https://youtube.com/watch?v=VIDEO_ID Quelle est la conclusion principale ?
    ```
 
 3. **Mode chat** :
    ```
-   /chat
+   /c
    Bonjour, peux-tu me résumer cette vidéo ?
    ```
+
+4. **Abonnement à une chaîne** :
+   ```
+   /sub https://www.youtube.com/@NomDeLaChaine
+   ```
+
+## Fonctionnement du bot
+
+- **Résumé automatique** : Envoyez un lien YouTube et le bot récupère les sous-titres, les résume et convertit le résumé en audio.
+- **Questions** : Posez des questions spécifiques sur le contenu d'une vidéo.
+- **Mode chat** : Discutez avec le bot sur n'importe quel sujet, en incluant des liens YouTube si nécessaire.
+- **Abonnements** : Recevez automatiquement des résumés des nouvelles vidéos de vos chaînes préférées.
 
 ## Structure du projet
 
@@ -112,6 +127,7 @@ youtube_bot/
 ├── requirements.txt    # Dépendances Python
 ├── run.sh              # Script de lancement pour Linux/macOS
 ├── run.bat             # Script de lancement pour Windows
+├── subscriptions.json  # Stockage des abonnements
 ├── docker-compose.yml  # Configuration Docker (optionnel)
 ├── Dockerfile          # Configuration Docker (optionnel)
 ├── .env.example        # Exemple de configuration

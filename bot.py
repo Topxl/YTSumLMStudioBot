@@ -218,6 +218,10 @@ def load_subscriptions():
 
 def extract_channel_id(url):
     """Extrait l'ID de la chaîne à partir de l'URL."""
+    # Nettoyer l'URL - supprimer les paramètres après ?
+    if "?" in url:
+        url = url.split("?")[0]
+    
     if "youtube.com/channel/" in url:
         # Format: https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw
         return url.split("youtube.com/channel/")[1].split("/")[0]
@@ -233,6 +237,10 @@ def extract_channel_id(url):
 def get_channel_info(url, api_key=None):
     """Obtient les informations de la chaîne à partir de l'URL."""
     try:
+        # Nettoyer l'URL - supprimer les paramètres après ?
+        if "?" in url:
+            url = url.split("?")[0]
+            
         # Essayer d'extraire directement l'ID de la chaîne
         channel_id = extract_channel_id(url)
         
@@ -585,27 +593,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(audio_path)
 
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    full_text = update.message.text
-    parts = full_text.split(" ", 1)
-    if len(parts) < 2:
-        await update.message.reply_text("❗ Utilisation : /question [lien YouTube] ? [votre question]")
+    message_text = update.message.text
+    message_parts = message_text.split(" ", 1)
+    
+    if len(message_parts) < 2:
+        await update.message.reply_text(
+            "❗ Utilisation : `/question [lien YouTube] [votre question]`\n\n"
+            "Exemple : `/question https://youtube.com/watch?v=VIDEO_ID Quelle est la conclusion principale ?`",
+            parse_mode="Markdown"
+        )
         return
-
-    if "?" not in parts[1]:
-        await update.message.reply_text("❗ Merci d'ajouter une question après le lien, séparée par un `?`")
+    
+    remaining_text = message_parts[1].strip()
+    
+    # Extraire l'URL et la question
+    words = remaining_text.split()
+    url = None
+    question_words = []
+    
+    for word in words:
+        if "youtube.com" in word or "youtu.be" in word:
+            url = word
+        else:
+            question_words.append(word)
+    
+    if not url:
+        await update.message.reply_text(
+            "❌ Je n'ai pas trouvé d'URL YouTube valide dans votre message.\n\n"
+            "Veuillez inclure un lien YouTube dans votre requête.",
+            parse_mode="Markdown"
+        )
         return
-
-    url_part, question = parts[1].split("?", 1)
-    url = url_part.strip()
-    question = question.strip()
-
+    
+    question = " ".join(question_words).strip()
+    
+    if not question:
+        await update.message.reply_text(
+            "❓ Vous n'avez pas posé de question. Que souhaitez-vous savoir sur cette vidéo ?",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Afficher un message d'attente
+    processing_message = await update.message.reply_text(
+        "⏳ Je récupère les sous-titres et analyse la vidéo...",
+        parse_mode="Markdown"
+    )
+    
+    # Récupérer les sous-titres
     subtitles, error = get_subtitles(url)
     if error:
-        await update.message.reply_text(error)
+        await processing_message.edit_text(
+            f"❌ {error}",
+            parse_mode="Markdown"
+        )
         return
-
+    
+    await processing_message.edit_text(
+        "⏳ J'analyse la vidéo et prépare une réponse à votre question...",
+        parse_mode="Markdown"
+    )
+    
+    # Répondre à la question
     answer = ask_question_about_subtitles(subtitles, question)
-    await update.message.reply_text(answer)
+    
+    # Supprimer le message d'attente et envoyer la réponse
+    await processing_message.delete()
+    await update.message.reply_text(
+        f"*Question* : {question}\n\n{answer}",
+        parse_mode="Markdown"
+    )
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
@@ -616,22 +673,26 @@ Ce bot vous permet d'interagir avec des vidéos YouTube de façon intelligente.
 📋 *Commandes disponibles* :
 
 • `/start` - Démarrer le bot
-• `/help` - Afficher ce message d'aide
-• `/chat` - Activer le mode conversation (pour discuter sur une vidéo)
-• `/chat_mode` - Changer le mode de conversation (libre ou guidé)
-• `/reset` - Réinitialiser l'historique de conversation
-• `/question [lien YouTube] ? [question]` - Poser une question sur une vidéo
-• `/subscribe [URL chaîne YouTube]` - S'abonner aux nouvelles vidéos d'une chaîne
-• `/unsubscribe [URL chaîne YouTube]` - Se désabonner d'une chaîne
-• `/list_subscriptions` - Afficher vos abonnements actuels
+• `/help` ou `/h` - Afficher ce message d'aide
 
-📝 *Comment utiliser* :
-1. Envoyez simplement un lien YouTube pour obtenir un résumé
-2. Utilisez `/question` pour poser des questions sur le contenu
-3. Abonnez-vous aux chaînes avec `/subscribe` pour recevoir des résumés automatiques des nouvelles vidéos
+*Résumé et questions* :
+• Envoyez un lien YouTube pour obtenir un résumé
+• `/question` ou `/q` - Poser une question sur une vidéo
 
-💡 *Exemple de question* :
-`/question https://youtube.com/watch?v=VIDEO_ID ? Quelle est la conclusion principale ?`
+*Mode conversation* :
+• `/chat` ou `/c` - Activer le mode conversation
+• `/mode` - Changer le mode conversation (libre/guidé)
+• `/reset` ou `/r` - Effacer l'historique de conversation
+
+*Abonnements* :
+• `/subscribe` ou `/sub` - S'abonner à une chaîne
+• `/unsubscribe` ou `/unsub` - Se désabonner
+• `/list` ou `/subs` - Voir vos abonnements
+
+📝 *Exemples* :
+1. Résumé : envoyez simplement un lien YouTube
+2. Question : `/q https://youtube.com/watch?v=VIDEO_ID Quelle est la conclusion ?`
+3. Abonnement : `/sub https://www.youtube.com/@NomDeLaChaine`
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -855,15 +916,32 @@ if __name__ == '__main__':
 
     # Handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Handler principal
     app.add_handler(CommandHandler("question", handle_question))
+    app.add_handler(CommandHandler("q", handle_question))  # Alias court pour question
+    
+    # Commandes d'aide et de démarrage
     app.add_handler(CommandHandler("help", handle_help))
+    app.add_handler(CommandHandler("h", handle_help))  # Alias court pour help
     app.add_handler(CommandHandler("start", handle_start))
+    
+    # Commandes chat
     app.add_handler(CommandHandler("chat", handle_chat))
+    app.add_handler(CommandHandler("c", handle_chat))  # Alias court pour chat
     app.add_handler(CommandHandler("chat_mode", handle_chat_mode))
+    app.add_handler(CommandHandler("mode", handle_chat_mode))  # Alias plus intuitif
     app.add_handler(CommandHandler("reset", handle_reset))
+    app.add_handler(CommandHandler("r", handle_reset))  # Alias court pour reset
+    
+    # Commandes d'abonnement
     app.add_handler(CommandHandler("subscribe", handle_subscribe))
+    app.add_handler(CommandHandler("sub", handle_subscribe))  # Alias court pour subscribe
     app.add_handler(CommandHandler("unsubscribe", handle_unsubscribe))
+    app.add_handler(CommandHandler("unsub", handle_unsubscribe))  # Alias court pour unsubscribe
     app.add_handler(CommandHandler("list_subscriptions", handle_list_subscriptions))
+    app.add_handler(CommandHandler("list", handle_list_subscriptions))  # Alias court pour list_subscriptions
+    app.add_handler(CommandHandler("subs", handle_list_subscriptions))  # Alias court pour list_subscriptions
     
     # Démarrer le planificateur
     scheduler_status = start_video_check_scheduler(app)
