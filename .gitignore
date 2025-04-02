@@ -1,6 +1,9 @@
 # Fichiers d'environnement
 .env
 
+# Fichiers de données et de configuration utilisateur
+subscriptions.json
+
 # Fichiers Python
 __pycache__/
 *.py[cod]
