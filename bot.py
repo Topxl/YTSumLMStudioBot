@@ -10,12 +10,60 @@ import json
 import urllib.parse
 from datetime import datetime
 from googleapiclient.discovery import build
+import time
+import asyncio
+import telegram
 
 # --- Config ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LM_API_URL = os.getenv("LM_API_URL")
 LM_MODEL_NAME = os.getenv("LM_MODEL_NAME")
+
+# Fonction pour vérifier la disponibilité de LM Studio
+def check_lmstudio_availability():
+    """Vérifie si LM Studio est accessible et configuré correctement"""
+    if not LM_API_URL:
+        print("❌ Erreur: LM_API_URL non défini dans le fichier .env")
+        return False
+    
+    if not LM_MODEL_NAME:
+        print("❌ Erreur: LM_MODEL_NAME non défini dans le fichier .env")
+        return False
+    
+    api_url = LM_API_URL.rstrip('/')
+    if not api_url.endswith('/v1/chat/completions'):
+        api_url = f"{api_url}/v1/chat/completions"
+    
+    print(f"🔍 Test de connexion à LM Studio sur {api_url}...")
+    
+    try:
+        # Requête simple pour tester l'API
+        payload = {
+            "model": LM_MODEL_NAME,
+            "messages": [{"role": "user", "content": "Test de connexion"}],
+            "max_tokens": 5,
+            "temperature": 0.1
+        }
+        
+        # Augmenter le timeout pour la vérification
+        response = requests.post(api_url, json=payload, timeout=30)  # Augmenté de 10 à 30 secondes
+        
+        if response.status_code == 200:
+            print("✅ Connexion à LM Studio réussie!")
+            return True
+        else:
+            print(f"❌ Erreur de connexion à LM Studio: {response.status_code} - {response.text}")
+            return False
+    except requests.exceptions.ConnectionError:
+        print("❌ Erreur: Impossible de se connecter à LM Studio. Vérifiez que le serveur est bien lancé.")
+        return False
+    except requests.exceptions.Timeout:
+        print("❌ Erreur: Timeout lors de la connexion à LM Studio.")
+        return False
+    except Exception as e:
+        print(f"❌ Erreur lors du test de connexion à LM Studio: {e}")
+        return False
 
 print("=== Configuration chargée ===")
 print(f"TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:10]}..." if TELEGRAM_TOKEN else "TELEGRAM_TOKEN non défini")
@@ -78,14 +126,53 @@ def get_subtitles(video_url):
         return None, f"[Erreur récupération sous-titres] {str(e)}"
 
 def split_text(text, max_chars=12000):
+    """
+    Divise un texte en parties plus petites en essayant de respecter les phrases.
+    
+    Args:
+        text (str): Le texte à diviser
+        max_chars (int): Nombre maximum de caractères par partie
+        
+    Returns:
+        list: Liste des parties du texte
+    """
+    print(f"Découpage du texte ({len(text)} caractères) en chunks de max {max_chars} caractères")
+    
+    # Si le texte est déjà assez court, le retourner tel quel
+    if len(text) <= max_chars:
+        return [text]
+        
     parts = []
-    while len(text) > max_chars:
-        split_index = text[:max_chars].rfind(". ") + 1
-        if split_index == 0:
+    remaining_text = text
+    
+    while len(remaining_text) > max_chars:
+        # Chercher une fin de phrase (point suivi d'un espace) dans la plage max_chars
+        split_index = remaining_text[:max_chars].rfind(". ") + 1
+        
+        # Si pas de point trouvé, chercher d'autres délimiteurs possibles
+        if split_index <= 1:
+            # Essayer avec une virgule suivie d'un espace
+            split_index = remaining_text[:max_chars].rfind(", ") + 1
+            
+        # Si toujours pas trouvé, chercher un saut de ligne
+        if split_index <= 1:
+            split_index = remaining_text[:max_chars].rfind("\n") + 1
+            
+        # Si aucun délimiteur naturel n'a été trouvé, couper au maximum autorisé
+        if split_index <= 1:
             split_index = max_chars
-        parts.append(text[:split_index].strip())
-        text = text[split_index:].strip()
-    parts.append(text.strip())
+        
+        # Extraire la partie et l'ajouter à la liste
+        parts.append(remaining_text[:split_index].strip())
+        
+        # Mettre à jour le texte restant
+        remaining_text = remaining_text[split_index:].strip()
+    
+    # Ajouter le reste du texte s'il en reste
+    if remaining_text:
+        parts.append(remaining_text)
+    
+    print(f"Texte découpé en {len(parts)} parties")
     return parts
 
 def chat_with_lmstudio(messages):
@@ -102,27 +189,34 @@ def chat_with_lmstudio(messages):
         if not api_url.endswith('/v1/chat/completions'):
             api_url = f"{api_url}/v1/chat/completions"
         
-        print(f"Envoi de requête à {api_url} avec le modèle {LM_MODEL_NAME}")
+        print(f"Envoi de requête à {api_url}")
         
-        # Préparer le prompt en combinant tous les messages
-        prompt = ""
+        # Préparation des messages au format OpenAI
+        formatted_messages = []
         for msg in messages:
-            if msg["role"] == "system":
-                prompt += f"System: {msg['content']}\n"
-            elif msg["role"] == "user":
-                prompt += f"Human: {msg['content']}\n"
-            elif msg["role"] == "assistant":
-                prompt += f"Assistant: {msg['content']}\n"
+            # S'assurer que le rôle est valide (system, user, assistant)
+            if msg["role"] not in ["system", "user", "assistant"]:
+                continue
+            formatted_messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
         
-        # Format de requête pour LM Studio
+        # S'assurer qu'il y a au moins un message
+        if not formatted_messages:
+            return "[Erreur] Aucun message valide à envoyer"
+        
+        # Format de requête compatible avec LM Studio (API OpenAI)
         payload = {
-            "messages": [{"role": "user", "content": prompt}],
+            "model": LM_MODEL_NAME,  # Spécifier explicitement le modèle
+            "messages": formatted_messages,
             "temperature": float(os.getenv("LM_TEMPERATURE", "0.7")),
             "max_tokens": int(os.getenv("LM_MAX_TOKENS", "2000")),
             "stream": False
         }
 
-        response = requests.post(api_url, json=payload)
+        # Utiliser un timeout plus long pour les modèles lourds (augmenté à 5 minutes)
+        response = requests.post(api_url, json=payload, timeout=300)  # 5 minutes de timeout (augmenté de 2 à 5 minutes)
 
         if response.status_code == 200:
             try:
@@ -132,48 +226,131 @@ def chat_with_lmstudio(messages):
                 else:
                     error_msg = "[Erreur LM Studio] Format de réponse invalide"
                     print(error_msg)
+                    print(f"Réponse complète : {result}")
                     return error_msg
             except Exception as e:
                 error_msg = f"[Erreur LM Studio] Erreur lors du parsing de la réponse: {str(e)}"
                 print(error_msg)
                 return error_msg
         else:
+            # Afficher plus de détails sur l'erreur
             error_msg = f"[Erreur LM Studio] Code {response.status_code} : {response.text}"
             print(error_msg)
             return error_msg
+    except requests.exceptions.Timeout:
+        error_msg = "[Erreur LM Studio] Timeout de la requête. Le serveur prend trop de temps à répondre."
+        print(error_msg)
+        return error_msg
+    except requests.exceptions.ConnectionError:
+        error_msg = "[Erreur LM Studio] Erreur de connexion. Vérifiez que LM Studio est bien lancé et accessible."
+        print(error_msg)
+        return error_msg
     except Exception as e:
         error_msg = f"[Erreur LM Studio] {str(e)}"
         print(error_msg)
         return error_msg
 
 def summarize(text):
-    chunks = split_text(text)
-    summaries = []
+    try:
+        # Diviser le texte en chunks plus petits pour une meilleure fiabilité
+        max_chunk_size = int(os.getenv("LM_CHUNK_SIZE", "6000"))  # Réduit de 12000 à 6000
+        chunks = split_text(text, max_chunk_size)
+        summaries = []
 
-    prompt = (
-        "Fais un résumé du contenu en apportant un maximum de valeur au lecteur. "
-        "Utilise des points clairs, sans répétition, et mets en avant les idées clés."
-    )
+        prompt = (
+            "Fais un résumé du contenu en apportant un maximum de valeur au lecteur. "
+            "Commence par un titre accrocheur qui résume le sujet principal, suivi d'un tiret. "
+            "Utilise des points clairs, sans répétition, et mets en avant les idées clés. "
+            "N'utilise pas de formatage Markdown comme les astérisques, les crochets ou autres caractères spéciaux."
+        )
 
-    for chunk in chunks:
+        print(f"Traitement de {len(chunks)} chunks pour résumé...")
+        
+        for i, chunk in enumerate(chunks):
+            try:
+                print(f"Résumé du chunk {i+1}/{len(chunks)} (taille: {len(chunk)} caractères)")
+                messages = [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": chunk}
+                ]
+                
+                # Obtenir le résumé pour ce chunk
+                chunk_summary = chat_with_lmstudio(messages)
+                
+                # Nettoyer immédiatement le résumé
+                chunk_summary = sanitize_markdown(chunk_summary)
+                
+                # Vérifier si le résumé contient une erreur
+                if chunk_summary.startswith("[Erreur"):
+                    print(f"Erreur lors du résumé du chunk {i+1}: {chunk_summary}")
+                    # En cas d'erreur, simplifier la demande pour ce chunk
+                    simplified_messages = [
+                        {"role": "system", "content": "Résume ce texte simplement sans formatage, en commençant par un titre suivi d'un tiret."},
+                        {"role": "user", "content": chunk[:max_chunk_size // 2]}  # Utiliser moitié moins de texte
+                    ]
+                    chunk_summary = chat_with_lmstudio(simplified_messages)
+                    chunk_summary = sanitize_markdown(chunk_summary)
+                    
+                # Si toujours en erreur, utiliser un résumé générique
+                if chunk_summary.startswith("[Erreur"):
+                    chunk_summary = f"[Contenu du segment {i+1}]"
+                
+                summaries.append(chunk_summary)
+            except Exception as e:
+                print(f"Erreur lors du traitement du chunk {i+1}: {str(e)}")
+                summaries.append(f"[Erreur dans le segment {i+1}: {str(e)}]")
+
+        # S'il n'y a qu'un seul résumé, pas besoin de fusion
+        if len(summaries) == 1:
+            return sanitize_markdown(summaries[0])
+            
+        # S'il y a trop de résumés, les regrouper par petits groupes
+        if len(summaries) > 5:
+            print(f"Fusion de {len(summaries)} résumés en groupes...")
+            grouped_summaries = []
+            group_size = 3
+            
+            for i in range(0, len(summaries), group_size):
+                group = summaries[i:i+group_size]
+                fusion_message = [
+                    {"role": "system", "content": "Fusionne ces résumés partiels en un seul résumé cohérent sans formatage, en commençant par un titre suivi d'un tiret."},
+                    {"role": "user", "content": "\n\n".join(group)}
+                ]
+                group_summary = chat_with_lmstudio(fusion_message)
+                group_summary = sanitize_markdown(group_summary)
+                grouped_summaries.append(group_summary)
+                
+            summaries = grouped_summaries
+
+        # Fusion finale des résumés
+        print("Fusion finale des résumés...")
+        fusion_prompt = (
+            "Voici plusieurs résumés partiels d'une vidéo. "
+            "Fusionne-les en un résumé cohérent en commençant par un titre accrocheur qui résume le sujet principal, suivi d'un tiret. "
+            "Mets en avant les idées clés et les informations qui apportent le plus de valeur au lecteur. "
+            "N'utilise pas de formatage comme des astérisques ou du markdown."
+        )
+
         messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": chunk}
+            {"role": "system", "content": fusion_prompt},
+            {"role": "user", "content": "\n\n".join(summaries)}
         ]
-        summary = chat_with_lmstudio(messages)
-        summaries.append(summary)
-
-    fusion_prompt = (
-        "Voici plusieurs résumés partiels d'une vidéo. "
-        "Fusionne-les en un résumé"
-        "en mettant en avant les idées clés et les informations qui apportent le plus de valeur au lecteur."
-    )
-
-    messages = [
-        {"role": "system", "content": fusion_prompt},
-        {"role": "user", "content": "\n\n".join(summaries)}
-    ]
-    return chat_with_lmstudio(messages)
+        final_summary = chat_with_lmstudio(messages)
+        
+        # Nettoyer une dernière fois le résumé final
+        final_summary = sanitize_markdown(final_summary)
+        
+        # Si la fusion finale échoue, retourner la concaténation des résumés
+        if final_summary.startswith("[Erreur"):
+            print(f"Erreur lors de la fusion finale: {final_summary}")
+            concatenated = "\n\n".join([f"Partie {i+1}:\n{summary}" for i, summary in enumerate(summaries)])
+            return sanitize_markdown(concatenated)
+            
+        return final_summary
+    except Exception as e:
+        error_msg = f"[Erreur lors de la génération du résumé] {str(e)}"
+        print(error_msg)
+        return error_msg
 
 def ask_question_about_subtitles(subtitles, question):
     prompt = (
@@ -186,8 +363,136 @@ def ask_question_about_subtitles(subtitles, question):
     ]
     return chat_with_lmstudio(messages)
 
+def sanitize_markdown(text):
+    """
+    Nettoie le texte pour éviter les erreurs de formatage Markdown dans Telegram.
+    Supprime complètement les caractères spéciaux de Markdown au lieu de les échapper.
+    Décode également les entités HTML communes.
+    """
+    if not text:
+        return ""
+    
+    # Étape 1: Décoder les entités HTML courantes
+    html_entities = {
+        '&quot;': '"',
+        '&apos;': "'",
+        '&#39;': "'",
+        '&lt;': '<',
+        '&gt;': '>',
+        '&amp;': '&',
+        '&nbsp;': ' ',
+        '&ndash;': '-',
+        '&mdash;': '—',
+        '&lsquo;': ''',
+        '&rsquo;': ''',
+        '&ldquo;': '"',
+        '&rdquo;': '"',
+        '&bull;': '•',
+        '&hellip;': '...',
+        '&trade;': '™',
+        '&copy;': '©',
+        '&reg;': '®',
+    }
+    
+    # Appliquer le remplacement pour les entités HTML connues
+    for entity, replacement in html_entities.items():
+        text = text.replace(entity, replacement)
+    
+    # Rechercher et remplacer d'autres entités HTML numériques (comme &#123;)
+    import re
+    text = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), text)
+    
+    # Étape 2: Nettoyer les caractères de formatage Markdown
+    # 1. Supprimer les astérisques (formatage gras/italique)
+    text = text.replace('**', '').replace('*', '')
+    
+    # 2. Supprimer les soulignements (formatage italique)
+    text = text.replace('__', '').replace('_', ' ')
+    
+    # 3. Supprimer les caractères spéciaux qui peuvent être interprétés comme du Markdown
+    text = text.replace('`', '').replace('~', '').replace('#', '')
+    
+    # 4. Remplacer les crochets et parenthèses utilisés pour les liens
+    text = text.replace('[', '').replace(']', '')
+    
+    # 5. Nettoyer les caractères utilisés pour les listes et citations
+    text = text.replace('>', ' ').replace('- ', '').replace('+ ', '')
+    
+    # 6. Nettoyer les autres caractères problématiques
+    text = text.replace('|', ' ').replace('\\', '')
+    
+    # 7. Supprimer les doubles espaces créés par les remplacements
+    while '  ' in text:
+        text = text.replace('  ', ' ')
+    
+    # 8. Supprimer les répétitions bizarres que certains modèles peuvent générer
+    repeated_patterns = [
+        (r'(\w+)\1{2,}', r'\1'),  # Mots répétés plus de 2 fois consécutives
+        (r'([.!?]){3,}', r'\1\1\1'),  # Plus de 3 ponctuations de suite
+    ]
+    
+    for pattern, replacement in repeated_patterns:
+        text = re.sub(pattern, replacement, text)
+    
+    return text
+
+def clean_text_for_audio(text):
+    """
+    Nettoie le texte spécifiquement pour la synthèse vocale.
+    Supprime les marqueurs de formatage et les caractères qui ne doivent pas être prononcés.
+    """
+    # Commencer par le nettoyage complet (Markdown + HTML)
+    clean_text = sanitize_markdown(text)
+    
+    # Nettoyer les éléments spécifiques à l'audio
+    clean_text = clean_text.replace('(', ', ').replace(')', ', ')
+    clean_text = clean_text.replace(':', ', ').replace(';', ', ')
+    clean_text = clean_text.replace('/', ' ou ')
+    
+    # Remplacer les URL par un texte plus simple
+    url_pattern = r'https?://[^\s]+'
+    clean_text = re.sub(url_pattern, 'lien vers le site', clean_text)
+    
+    # Remplacer certains symboles par leur prononciation
+    clean_text = clean_text.replace('%', ' pourcent ')
+    clean_text = clean_text.replace('&', ' et ')
+    clean_text = clean_text.replace('=', ' égal ')
+    clean_text = clean_text.replace('+', ' plus ')
+    clean_text = clean_text.replace('-', ' moins ')
+    
+    # Remplacer les chiffres ordinaux par leur forme prononcée
+    ordinals = {
+        '1er': 'premier',
+        '2e': 'deuxième',
+        '3e': 'troisième',
+        '4e': 'quatrième',
+        '5e': 'cinquième',
+        '6e': 'sixième',
+        '7e': 'septième',
+        '8e': 'huitième',
+        '9e': 'neuvième',
+        '10e': 'dixième'
+    }
+    
+    for ordinal, pronunciation in ordinals.items():
+        clean_text = re.sub(r'\b' + ordinal + r'\b', pronunciation, clean_text)
+    
+    # Nettoyer les doubles espaces
+    while '  ' in clean_text:
+        clean_text = clean_text.replace('  ', ' ')
+    
+    return clean_text
+
 def text_to_audio(text, filename="resume.mp3"):
-    tts = gTTS(text, lang='fr')
+    """
+    Convertit le texte en fichier audio MP3.
+    Nettoie le texte avant de le convertir pour éviter les problèmes de prononciation.
+    """
+    # Nettoyer le texte pour la synthèse vocale
+    clean_text = clean_text_for_audio(text)
+    
+    # Convertir en audio
+    tts = gTTS(clean_text, lang='fr')
     tts.save(filename)
     return filename
 
@@ -396,7 +701,7 @@ async def check_new_videos(context):
             if not new_videos:
                 print(f"Aucune nouvelle vidéo pour {channel_id}")
                 continue
-            
+                
             print(f"Nouvelles vidéos pour {channel_id}: {len(new_videos)}")
             
             # Mettre à jour la liste des vidéos connues
@@ -434,7 +739,10 @@ async def check_new_videos(context):
                 # Résumer la vidéo
                 summary = summarize(subtitles)
                 
-                # Créer le fichier audio
+                # Nettoyer complètement le résumé des marqueurs Markdown et autres caractères problématiques
+                clean_summary = sanitize_markdown(summary)
+                
+                # Créer le fichier audio (text_to_audio nettoiera aussi le texte pour l'audio)
                 audio_path = text_to_audio(summary, f"resume_{video_id}.mp3")
                 
                 # Pour chaque utilisateur abonné, envoyer le résumé
@@ -442,17 +750,18 @@ async def check_new_videos(context):
                     try:
                         channel_name = CHANNEL_SUBSCRIPTIONS[user_id][channel_id]
                         
-                        # Envoi du message texte
+                        # Envoi du message texte en gérant les messages longs
                         message = (
-                            f"🆕 *Nouvelle vidéo de {channel_name}*\n\n"
-                            f"📺 [{video_title}]({video_url})\n\n"
-                            f"📝 *Résumé* :\n{summary}"
+                            f"🆕 Nouvelle vidéo de {channel_name}\n\n"
+                            f"📺 {video_title}\n"
+                            f"🔗 {video_url}\n\n"
+                            f"📝 Résumé :\n{clean_summary}"
                         )
                         
-                        await context.bot.send_message(
+                        await send_long_message(
+                            context.bot,
                             chat_id=user_id,
-                            text=message,
-                            parse_mode="Markdown"
+                            text=message
                         )
                         
                         # Envoi du fichier audio
@@ -501,12 +810,11 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CONVERSATION_HISTORY[user_id] = []
     
     await update.message.reply_text(
-        f"💬 *Mode chat activé* - {CHAT_MODES[USER_CHAT_MODES[user_id]]}\n\n"
+        f"💬 Mode chat activé - {CHAT_MODES[USER_CHAT_MODES[user_id]]}\n\n"
         "Vous pouvez maintenant discuter avec moi à propos de vidéos YouTube.\n"
-        "Envoyez `/chat_mode` pour changer de mode de conversation.\n"
-        "Envoyez `/reset` pour effacer l'historique de conversation.\n"
-        "Envoyez n'importe quel message pour continuer la conversation.",
-        parse_mode="Markdown"
+        "Envoyez /chat_mode pour changer de mode de conversation.\n"
+        "Envoyez /reset pour effacer l'historique de conversation.\n"
+        "Envoyez n'importe quel message pour continuer la conversation."
     )
 
 async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -518,9 +826,8 @@ async def handle_chat_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_CHAT_MODES[user_id] = new_mode
     
     await update.message.reply_text(
-        f"🔄 *Mode de conversation modifié*\n\n"
-        f"Nouveau mode : {CHAT_MODES[new_mode]}",
-        parse_mode="Markdown"
+        f"🔄 Mode de conversation modifié\n\n"
+        f"Nouveau mode : {CHAT_MODES[new_mode]}"
     )
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -528,9 +835,8 @@ async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CONVERSATION_HISTORY[user_id] = []
     
     await update.message.reply_text(
-        "🗑️ *Historique de conversation effacé*\n\n"
-        "Votre conversation a été réinitialisée.",
-        parse_mode="Markdown"
+        "🗑️ Historique de conversation effacé\n\n"
+        "Votre conversation a été réinitialisée."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -567,30 +873,150 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Obtenir la réponse
         response = chat_with_lmstudio(messages)
         
-        # Ajouter la réponse à l'historique
-        CONVERSATION_HISTORY[user_id].append({"role": "assistant", "content": response})
+        # Nettoyer la réponse des marqueurs Markdown
+        clean_response = sanitize_markdown(response)
         
-        # Envoyer la réponse
-        await update.message.reply_text(response)
+        # Ajouter la réponse à l'historique
+        CONVERSATION_HISTORY[user_id].append({"role": "assistant", "content": clean_response})
+        
+        # Envoyer la réponse sans formater en Markdown, en gérant les messages longs
+        await send_long_message(context.bot, chat_id=update.effective_chat.id, text=clean_response)
         return
     
-    # Comportement normal (non-chat) : résumé de vidéo YouTube
-    url = message_text
-    subtitles, error = get_subtitles(url)
-    if error:
-        await update.message.reply_text(error)
-        return
-
-    summary = summarize(subtitles)
-    await update.message.reply_text(summary)
-
-    audio_path = text_to_audio(summary)
-    with open(audio_path, 'rb') as audio_file:
-        await update.message.reply_voice(voice=audio_file)
+    # Comportement normal (non-chat) : traitement des liens YouTube
+    # Rechercher tous les liens YouTube dans le message
+    youtube_links = []
+    words = message_text.split()
     
-    # Supprimer le fichier audio après l'envoi
-    if os.path.exists(audio_path):
-        os.remove(audio_path)
+    for word in words:
+        if "youtube.com" in word or "youtu.be" in word:
+            if extract_video_id(word):
+                youtube_links.append(word)
+    
+    if not youtube_links:
+        await update.message.reply_text("Aucun lien YouTube valide trouvé dans votre message.")
+        return
+    
+    # Limiter le nombre de liens à traiter à la fois pour éviter les timeouts
+    max_links = 6  # Limiter à 6 vidéos par message (augmenté de 3 à 6)
+    if len(youtube_links) > max_links:
+        await update.message.reply_text(
+            f"⚠️ Attention: Vous avez envoyé {len(youtube_links)} liens, mais je vais traiter seulement les {max_links} premiers pour éviter des problèmes de timeout.\n"
+            f"Pour traiter plus de vidéos, envoyez-les en plusieurs messages."
+        )
+        youtube_links = youtube_links[:max_links]
+    
+    # Message initial pour informer l'utilisateur
+    status_message = await update.message.reply_text(
+        f"🔍 J'ai trouvé {len(youtube_links)} liens YouTube. Je vais les traiter un par un..."
+    )
+    
+    # Traiter chaque lien YouTube séparément
+    for i, url in enumerate(youtube_links):
+        try:
+            # Mise à jour du message de statut
+            await status_message.edit_text(
+                f"⏳ Traitement du lien {i+1}/{len(youtube_links)}: {url}"
+            )
+            
+            # Récupérer les sous-titres
+            subtitles, error = get_subtitles(url)
+            if error:
+                await update.message.reply_text(f"❌ Erreur pour {url}: {error}")
+                # Attendre un peu avant de passer au lien suivant
+                await asyncio.sleep(1)
+                continue
+            
+            # Générer le résumé
+            summary = summarize(subtitles)
+            
+            # Double nettoyage pour garantir l'absence de caractères spéciaux
+            clean_summary = sanitize_markdown(sanitize_markdown(summary))
+            
+            # Vérifier qu'il n'y a pas d'entités HTML non décodées
+            if '&' in clean_summary and (';' in clean_summary):
+                # Log du problème
+                print(f"Attention: Possible entité HTML non décodée dans le résumé {i+1}")
+                # Nettoyage agressif - supprimer les séquences problématiques
+                import re
+                clean_summary = re.sub(r'&[#\w]+;', '', clean_summary)
+            
+            try:
+                # Envoyer le résumé texte en gérant les messages longs
+                message_text = f"📝 Résumé de {url} :\n\n{clean_summary}"
+                await send_long_message(context.bot, chat_id=update.effective_chat.id, text=message_text)
+                
+                # Attendre un peu pour éviter de submerger l'API Telegram
+                await asyncio.sleep(4)  # Augmenté de 2 à 4 secondes
+                
+                # Créer et envoyer l'audio (texte_to_audio va maintenant nettoyer le texte automatiquement)
+                audio_path = text_to_audio(summary, f"resume_{i+1}.mp3")
+                
+                try:
+                    with open(audio_path, 'rb') as audio_file:
+                        await update.message.reply_voice(
+                            voice=audio_file,
+                            caption=f"🎙️ Résumé audio de la vidéo {i+1}/{len(youtube_links)}"
+                        )
+                    
+                    # Attendre un peu entre chaque envoi pour éviter les timeouts
+                    await asyncio.sleep(4)  # Augmenté de 2 à 4 secondes
+                except telegram.error.TimedOut:
+                    # Augmenter le nombre de tentatives pour l'envoi audio
+                    retry_count = 0
+                    max_audio_retries = 3
+                    
+                    while retry_count < max_audio_retries:
+                        try:
+                            retry_count += 1
+                            print(f"Tentative {retry_count} d'envoi de l'audio pour la vidéo {i+1}")
+                            await asyncio.sleep(3 * retry_count)  # Attente progressive
+                            
+                            with open(audio_path, 'rb') as audio_file:
+                                await update.message.reply_voice(
+                                    voice=audio_file,
+                                    caption=f"🎙️ Résumé audio de la vidéo {i+1}/{len(youtube_links)} (tentative {retry_count})"
+                                )
+                            break  # Sortir de la boucle si réussi
+                        except telegram.error.TimedOut:
+                            if retry_count >= max_audio_retries:
+                                await update.message.reply_text(
+                                    f"⚠️ L'envoi de l'audio a échoué après {max_audio_retries} tentatives. "
+                                    f"Le fichier est probablement trop volumineux pour Telegram."
+                                )
+                            # Sinon continuer avec la prochaine tentative
+                finally:
+                    # Supprimer le fichier audio après l'envoi (même en cas d'erreur)
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+            
+            except Exception as e:
+                print(f"Erreur lors du traitement de {url}: {str(e)}")
+                await update.message.reply_text(f"❌ Erreur lors du traitement de {url}: {str(e)}")
+                # Continuer avec le prochain lien même en cas d'erreur
+                await asyncio.sleep(2)  # Augmenté de 1 à 2 secondes
+                continue
+        
+        except telegram.error.TimedOut:
+            # Gérer spécifiquement les timeouts de Telegram
+            await update.message.reply_text(
+                f"⚠️ Le traitement de {url} a pris trop de temps et Telegram a interrompu la connexion. "
+                f"Je passe au lien suivant."
+            )
+            await asyncio.sleep(5)  # Augmenté de 3 à 5 secondes
+            continue
+        except Exception as e:
+            print(f"Erreur inattendue lors du traitement de {url}: {str(e)}")
+            await update.message.reply_text(f"❌ Erreur inattendue: {str(e)}")
+            await asyncio.sleep(1)
+            continue
+    
+    # Mise à jour du message de statut final
+    try:
+        await status_message.edit_text(f"✅ Traitement terminé pour {len(youtube_links)} vidéos YouTube.")
+    except:
+        # Si le message a été supprimé ou ne peut pas être édité
+        pass
 
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text
@@ -599,8 +1025,7 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(message_parts) < 2:
         await update.message.reply_text(
             "❗ Utilisation : `/question [lien YouTube] [votre question]`\n\n"
-            "Exemple : `/question https://youtube.com/watch?v=VIDEO_ID Quelle est la conclusion principale ?`",
-            parse_mode="Markdown"
+            "Exemple : `/question https://youtube.com/watch?v=VIDEO_ID Quelle est la conclusion principale ?`"
         )
         return
     
@@ -620,8 +1045,7 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not url:
         await update.message.reply_text(
             "❌ Je n'ai pas trouvé d'URL YouTube valide dans votre message.\n\n"
-            "Veuillez inclure un lien YouTube dans votre requête.",
-            parse_mode="Markdown"
+            "Veuillez inclure un lien YouTube dans votre requête."
         )
         return
     
@@ -629,86 +1053,94 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not question:
         await update.message.reply_text(
-            "❓ Vous n'avez pas posé de question. Que souhaitez-vous savoir sur cette vidéo ?",
-            parse_mode="Markdown"
+            "❓ Vous n'avez pas posé de question. Que souhaitez-vous savoir sur cette vidéo?"
         )
         return
     
     # Afficher un message d'attente
     processing_message = await update.message.reply_text(
-        "⏳ Je récupère les sous-titres et analyse la vidéo...",
-        parse_mode="Markdown"
+        "⏳ Je récupère les sous-titres et analyse la vidéo..."
     )
     
     # Récupérer les sous-titres
     subtitles, error = get_subtitles(url)
     if error:
         await processing_message.edit_text(
-            f"❌ {error}",
-            parse_mode="Markdown"
+            f"❌ {error}"
         )
         return
     
     await processing_message.edit_text(
-        "⏳ J'analyse la vidéo et prépare une réponse à votre question...",
-        parse_mode="Markdown"
+        "⏳ J'analyse la vidéo et prépare une réponse à votre question..."
     )
     
     # Répondre à la question
     answer = ask_question_about_subtitles(subtitles, question)
     
-    # Supprimer le message d'attente et envoyer la réponse
-    await processing_message.delete()
-    await update.message.reply_text(
-        f"*Question* : {question}\n\n{answer}",
-        parse_mode="Markdown"
-    )
+    # Nettoyer la réponse pour éviter les problèmes de formatage
+    clean_answer = sanitize_markdown(answer)
+    
+    try:
+        # Supprimer le message d'attente
+        await processing_message.delete()
+        # Envoyer la réponse en gérant les longs messages
+        full_message = f"Question : {question}\n\n{clean_answer}"
+        await send_long_message(context.bot, chat_id=update.effective_chat.id, text=full_message)
+    except Exception as e:
+        print(f"Erreur lors de l'envoi de la réponse: {str(e)}")
+        # En cas d'erreur, supprimer le message d'attente
+        try:
+            await processing_message.delete()
+        except:
+            pass
+        # Envoyer un message d'erreur
+        await update.message.reply_text(f"❌ Erreur lors de l'envoi de la réponse: {str(e)}")
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
-🤖 *Bot YouTube Telegram* 🤖
+🤖 Bot YouTube Telegram 🤖
 
 Ce bot vous permet d'interagir avec des vidéos YouTube de façon intelligente.
 
-📋 *Commandes disponibles* :
+📋 Commandes disponibles :
 
-• `/start` - Démarrer le bot
-• `/help` ou `/h` - Afficher ce message d'aide
+• /start - Démarrer le bot
+• /help ou /h - Afficher ce message d'aide
 
-*Résumé et questions* :
+Résumé et questions :
 • Envoyez un lien YouTube pour obtenir un résumé
-• `/question` ou `/q` - Poser une question sur une vidéo
+• /question ou /q - Poser une question sur une vidéo
 
-*Mode conversation* :
-• `/chat` ou `/c` - Activer le mode conversation
-• `/mode` - Changer le mode conversation (libre/guidé)
-• `/reset` ou `/r` - Effacer l'historique de conversation
+Mode conversation :
+• /chat ou /c - Activer le mode conversation
+• /mode - Changer le mode conversation (libre/guidé)
+• /reset ou /r - Effacer l'historique de conversation
 
-*Abonnements* :
-• `/subscribe` ou `/sub` - S'abonner à une chaîne
-• `/unsubscribe` ou `/unsub` - Se désabonner
-• `/list` ou `/subs` - Voir vos abonnements
+Abonnements :
+• /subscribe ou /sub - S'abonner à une chaîne
+• /unsubscribe ou /unsub - Se désabonner
+• /list ou /subs - Voir vos abonnements
 
-📝 *Exemples* :
+📝 Exemples :
 1. Résumé : envoyez simplement un lien YouTube
-2. Question : `/q https://youtube.com/watch?v=VIDEO_ID Quelle est la conclusion ?`
-3. Abonnement : `/sub https://www.youtube.com/@NomDeLaChaine`
+2. Question : /q https://youtube.com/watch?v=VIDEO_ID Quelle est la conclusion ?
+3. Abonnement : /sub https://www.youtube.com/@NomDeLaChaine
 """
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(help_text)
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = """
-👋 *Bienvenue sur le Bot YouTube Telegram* !
+👋 Bienvenue sur le Bot YouTube Telegram !
 
 Ce bot vous aide à obtenir des résumés et à poser des questions sur des vidéos YouTube grâce à l'intelligence artificielle.
 
-🔍 *Pour commencer* :
+🔍 Pour commencer :
 • Envoyez simplement un lien YouTube pour obtenir un résumé
-• Utilisez `/help` pour voir toutes les commandes disponibles
+• Utilisez /help pour voir toutes les commandes disponibles
 
 Bonne utilisation ! 🚀
 """
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(welcome_text)
 
 async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -716,9 +1148,8 @@ async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if len(message_parts) < 2:
         await update.message.reply_text(
-            "❗ Utilisation : `/subscribe [URL chaîne YouTube]`\n\n"
-            "Exemple : `/subscribe https://www.youtube.com/@NomDeLaChaine`",
-            parse_mode="Markdown"
+            "❗ Utilisation : /subscribe [URL chaîne YouTube]\n\n"
+            "Exemple : /subscribe https://www.youtube.com/@NomDeLaChaine"
         )
         return
     
@@ -728,8 +1159,7 @@ async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "youtube.com" not in channel_url and "youtu.be" not in channel_url:
         await update.message.reply_text(
             "❌ L'URL fournie n'est pas une URL YouTube valide.\n\n"
-            "Exemple d'URL valide : `https://www.youtube.com/@NomDeLaChaine`",
-            parse_mode="Markdown"
+            "Exemple d'URL valide : https://www.youtube.com/@NomDeLaChaine"
         )
         return
     
@@ -739,8 +1169,7 @@ async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not channel_info:
         await update.message.reply_text(
             "❌ Impossible d'obtenir les informations de cette chaîne.\n\n"
-            "Assurez-vous que l'URL est correcte.",
-            parse_mode="Markdown"
+            "Assurez-vous que l'URL est correcte."
         )
         return
     
@@ -754,8 +1183,7 @@ async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if channel_id in CHANNEL_SUBSCRIPTIONS[user_id]:
         await update.message.reply_text(
-            f"ℹ️ Vous êtes déjà abonné à la chaîne *{channel_name}*.",
-            parse_mode="Markdown"
+            f"ℹ️ Vous êtes déjà abonné à la chaîne {channel_name}."
         )
         return
     
@@ -769,9 +1197,8 @@ async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_subscriptions()
     
     await update.message.reply_text(
-        f"✅ Vous êtes maintenant abonné à la chaîne *{channel_name}*.\n\n"
-        "Vous recevrez des résumés des nouvelles vidéos publiées sur cette chaîne.",
-        parse_mode="Markdown"
+        f"✅ Vous êtes maintenant abonné à la chaîne {channel_name}.\n\n"
+        "Vous recevrez des résumés des nouvelles vidéos publiées sur cette chaîne."
     )
 
 async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -780,22 +1207,20 @@ async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     if user_id not in CHANNEL_SUBSCRIPTIONS or not CHANNEL_SUBSCRIPTIONS[user_id]:
         await update.message.reply_text(
-            "❗ Vous n'êtes abonné à aucune chaîne YouTube.",
-            parse_mode="Markdown"
+            "❗ Vous n'êtes abonné à aucune chaîne YouTube."
         )
         return
     
     if len(message_parts) < 2:
         # Liste les chaînes auxquelles l'utilisateur est abonné
-        channels_list = "\n".join([f"• *{name}* - `/unsubscribe {channel_id}`" 
+        channels_list = "\n".join([f"• {name} - /unsubscribe {channel_id}" 
                                  for channel_id, name in CHANNEL_SUBSCRIPTIONS[user_id].items()])
         
         await update.message.reply_text(
-            "❗ Utilisation : `/unsubscribe [ID chaîne YouTube]`\n\n"
+            "❗ Utilisation : /unsubscribe [ID chaîne YouTube]\n\n"
             "Vos abonnements actuels :\n"
             f"{channels_list}\n\n"
-            "Choisissez l'ID de la chaîne dont vous souhaitez vous désabonner.",
-            parse_mode="Markdown"
+            "Choisissez l'ID de la chaîne dont vous souhaitez vous désabonner."
         )
         return
     
@@ -807,8 +1232,7 @@ async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not channel_info:
             await update.message.reply_text(
                 "❌ Impossible d'obtenir les informations de cette chaîne.\n\n"
-                "Assurez-vous que l'URL est correcte.",
-                parse_mode="Markdown"
+                "Assurez-vous que l'URL est correcte."
             )
             return
         channel_id = channel_info["id"]
@@ -818,8 +1242,7 @@ async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Vérifie si l'utilisateur est abonné à cette chaîne
     if channel_id not in CHANNEL_SUBSCRIPTIONS[user_id]:
         await update.message.reply_text(
-            "❌ Vous n'êtes pas abonné à cette chaîne.",
-            parse_mode="Markdown"
+            "❌ Vous n'êtes pas abonné à cette chaîne."
         )
         return
     
@@ -837,8 +1260,7 @@ async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_subscriptions()
     
     await update.message.reply_text(
-        f"✅ Vous êtes maintenant désabonné de la chaîne *{channel_name}*.",
-        parse_mode="Markdown"
+        f"✅ Vous êtes maintenant désabonné de la chaîne {channel_name}."
     )
 
 async def handle_list_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -846,21 +1268,157 @@ async def handle_list_subscriptions(update: Update, context: ContextTypes.DEFAUL
     
     if user_id not in CHANNEL_SUBSCRIPTIONS or not CHANNEL_SUBSCRIPTIONS[user_id]:
         await update.message.reply_text(
-            "ℹ️ Vous n'êtes abonné à aucune chaîne YouTube.",
-            parse_mode="Markdown"
+            "ℹ️ Vous n'êtes abonné à aucune chaîne YouTube."
         )
         return
     
-    channels_list = "\n".join([f"• *{name}* (`{channel_id}`)" 
+    channels_list = "\n".join([f"• {name} ({channel_id})" 
                              for channel_id, name in CHANNEL_SUBSCRIPTIONS[user_id].items()])
     
     await update.message.reply_text(
-        "📋 *Vos abonnements actuels* :\n\n"
+        "📋 Vos abonnements actuels :\n\n"
         f"{channels_list}\n\n"
         "Pour vous désabonner d'une chaîne, utilisez :\n"
-        "`/unsubscribe [ID chaîne]`",
-        parse_mode="Markdown"
+        "/unsubscribe [ID chaîne]"
     )
+
+def split_message_for_telegram(text, max_length=4000):
+    """
+    Divise un message en plusieurs parties pour respecter la limite de taille de Telegram.
+    
+    Args:
+        text (str): Le texte à diviser
+        max_length (int): Longueur maximale d'un message (4096 est le max pour Telegram, on utilise 4000 par sécurité)
+        
+    Returns:
+        list: Liste des parties du message
+    """
+    if not text:
+        return [""]
+        
+    if len(text) <= max_length:
+        return [text]
+        
+    parts = []
+    current_part = ""
+    
+    # Diviser en paragraphes pour essayer de préserver la structure du texte
+    paragraphs = text.split('\n\n')
+    
+    for paragraph in paragraphs:
+        # Si ce paragraphe ferait dépasser la limite
+        if len(current_part) + len(paragraph) + 2 > max_length:
+            # Si le paragraphe lui-même est trop long
+            if len(paragraph) > max_length:
+                # Si la partie courante n'est pas vide, on l'ajoute
+                if current_part:
+                    parts.append(current_part)
+                    current_part = ""
+                
+                # On divise le paragraphe en morceaux
+                words = paragraph.split(' ')
+                for word in words:
+                    if len(current_part) + len(word) + 1 > max_length:
+                        parts.append(current_part)
+                        current_part = word
+                    else:
+                        if current_part:
+                            current_part += " " + word
+                        else:
+                            current_part = word
+            else:
+                # On ajoute la partie courante et on commence une nouvelle
+                parts.append(current_part)
+                current_part = paragraph
+        else:
+            # On ajoute le paragraphe à la partie courante
+            if current_part:
+                current_part += "\n\n" + paragraph
+            else:
+                current_part = paragraph
+    
+    # Ajouter la dernière partie si elle n'est pas vide
+    if current_part:
+        parts.append(current_part)
+    
+    return parts
+
+async def send_long_message(bot, chat_id, text, **kwargs):
+    """
+    Envoie un message potentiellement long en le divisant si nécessaire.
+    Gère les timeouts et ajoute des délais entre les messages pour éviter les erreurs Telegram.
+    
+    Args:
+        bot: L'instance du bot Telegram
+        chat_id: L'ID du chat où envoyer le message
+        text: Le texte du message
+        **kwargs: Arguments supplémentaires pour send_message
+        
+    Returns:
+        Le dernier message envoyé
+    """
+    if not text:
+        return None
+        
+    # Diviser le message si nécessaire
+    message_parts = split_message_for_telegram(text)
+    
+    last_message = None
+    
+    # Envoyer chaque partie avec délai entre les envois
+    for i, part in enumerate(message_parts):
+        # Ajouter un indicateur de partie pour les messages divisés
+        if len(message_parts) > 1:
+            part_indicator = f"[Partie {i+1}/{len(message_parts)}]\n\n"
+            part = part_indicator + part
+            
+        # Essayer d'envoyer avec gestion avancée des erreurs
+        max_retries = 5  # Augmenté de 3 à 5 tentatives
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Attendre un peu entre les messages (délai proportionnel à la longueur du message)
+                if i > 0:
+                    # Attendre entre 2 et 5 secondes selon la longueur du message (augmenté)
+                    wait_time = min(2 + (len(part) / 1500), 5)
+                    await asyncio.sleep(wait_time)
+                    
+                # Envoyer le message
+                last_message = await bot.send_message(chat_id=chat_id, text=part, **kwargs)
+                break  # Sortir de la boucle si l'envoi a réussi
+                
+            except telegram.error.TimedOut:
+                retry_count += 1
+                print(f"Timeout lors de l'envoi de la partie {i+1}/{len(message_parts)}. Tentative {retry_count}/{max_retries}...")
+                
+                if retry_count >= max_retries:
+                    # Si on a atteint le nombre maximum de tentatives
+                    print(f"Échec après {max_retries} tentatives pour la partie {i+1}.")
+                    
+                    # Essayer d'envoyer un message plus court
+                    try:
+                        error_msg = f"[Une partie du message n'a pas pu être envoyée en raison d'un timeout. Partie {i+1}/{len(message_parts)}]"
+                        last_message = await bot.send_message(chat_id=chat_id, text=error_msg)
+                    except:
+                        pass
+                else:
+                    # Attendre avant de réessayer (délai de plus en plus long, augmenté)
+                    await asyncio.sleep(3 * retry_count)
+                    
+            except Exception as e:
+                print(f"Erreur lors de l'envoi de la partie {i+1}: {e}")
+                
+                # Essayer avec un message plus simple
+                try:
+                    error_msg = f"[Impossible d'afficher une partie du message. Erreur: {str(e)}]"
+                    last_message = await bot.send_message(chat_id=chat_id, text=error_msg)
+                except:
+                    pass
+                    
+                break  # Passer à la partie suivante
+                
+    return last_message
 
 # --- Lancement du bot ---
 if __name__ == '__main__':
@@ -883,31 +1441,38 @@ if __name__ == '__main__':
     if not config_ok:
         print("\n⚠️ Le bot peut ne pas fonctionner correctement en raison de problèmes de configuration.")
         print("Veuillez vérifier le fichier .env et vous assurer que toutes les variables sont correctement définies.")
+        exit(1)
     else:
         print("✅ Configuration OK")
     
-    print("=== Fin de la vérification ===\n")
+    print("=== Fin de la vérification de configuration ===\n")
     
-    # Test de connexion à l'API LM
-    if LM_API_URL and LM_MODEL_NAME:
-        print("Test de connexion à l'API LM...")
-        try:
-            response = requests.post(
-                LM_API_URL, 
-                json={
-                    "model": LM_MODEL_NAME,
-                    "messages": [{"role": "user", "content": "test"}],
-                    "temperature": 0.7,
-                    "stream": False
-                },
-                timeout=5
-            )
-            if response.status_code == 200:
-                print("✅ Connexion à l'API LM établie avec succès")
-            else:
-                print(f"❌ Erreur de connexion à l'API LM: Code {response.status_code}")
-        except Exception as e:
-            print(f"❌ Erreur de connexion à l'API LM: {str(e)}")
+    # Test de connexion à LM Studio
+    print("=== Test de connexion à LM Studio ===")
+    max_retries = 3
+    retry_count = 0
+    lm_available = False
+    
+    while retry_count < max_retries and not lm_available:
+        if retry_count > 0:
+            print(f"Tentative {retry_count+1}/{max_retries}...")
+            time.sleep(3)  # Attendre avant de réessayer
+            
+        lm_available = check_lmstudio_availability()
+        retry_count += 1
+    
+    if not lm_available:
+        print("\n⚠️ ATTENTION: Impossible de se connecter à LM Studio après plusieurs tentatives.")
+        print("Le bot va démarrer, mais les fonctionnalités liées à LM Studio ne fonctionneront pas correctement.")
+        print("Veuillez vérifier que:")
+        print("1. LM Studio est bien lancé sur votre ordinateur")
+        print("2. L'API REST est activée dans les options de LM Studio")
+        print("3. L'URL dans votre fichier .env correspond à l'URL affichée dans LM Studio")
+        print("4. Le nom du modèle dans votre fichier .env correspond à un modèle chargé dans LM Studio")
+        print("\nAppuyez sur Ctrl+C pour arrêter le bot, ou attendez pour démarrer sans LM Studio...\n")
+        time.sleep(5)
+    else:
+        print("=== Fin du test de connexion ===\n")
     
     # Charger les abonnements existants
     load_subscriptions()
