@@ -86,6 +86,10 @@ LATEST_VIDEOS = {}  # Format: {channel_id: [video_ids]}
 SUBSCRIPTION_FILE = "subscriptions.json"
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))  # 30 minutes par défaut
 
+# File d'attente pour les liens YouTube à traiter
+# Format: {"chat_id": {"queue": [urls], "processing": False, "thread_id": None}}
+YOUTUBE_QUEUE = {}
+
 # --- Utilitaires ---
 
 def extract_video_id(url):
@@ -444,10 +448,30 @@ def clean_text_for_audio(text):
     # Commencer par le nettoyage complet (Markdown + HTML)
     clean_text = sanitize_markdown(text)
     
+    # Remplacer le tiret entre le titre et le contenu par une pause plus longue
+    # Cette regex cherche un tiret précédé par un mot et suivi par un espace
+    import re
+    clean_text = re.sub(r'(\w+)\s+-\s+', r'\1. ', clean_text)
+    
     # Nettoyer les éléments spécifiques à l'audio
     clean_text = clean_text.replace('(', ', ').replace(')', ', ')
     clean_text = clean_text.replace(':', ', ').replace(';', ', ')
     clean_text = clean_text.replace('/', ' ou ')
+    
+    # Améliorer la gestion des tirets
+    # Remplacer les tirets en début de ligne (puces) par un point
+    clean_text = re.sub(r'^\s*-\s+', '• ', clean_text, flags=re.MULTILINE)
+    
+    # Remplacer les tirets utilisés comme séparateurs de mots par "à" ou un espace selon le contexte
+    # Pour des nombres ou dates (ex: 1-2, 2020-2021)
+    clean_text = re.sub(r'(\d+)-(\d+)', r'\1 à \2', clean_text)
+    
+    # Pour les tirets entre des mots, utiliser un espace
+    clean_text = re.sub(r'([a-zA-Z])-([a-zA-Z])', r'\1 \2', clean_text)
+    
+    # Remplacer les tirets restants par des pauses légères
+    clean_text = clean_text.replace(' - ', '. ')
+    clean_text = clean_text.replace('-', ' ')
     
     # Remplacer les URL par un texte plus simple
     url_pattern = r'https?://[^\s]+'
@@ -458,7 +482,6 @@ def clean_text_for_audio(text):
     clean_text = clean_text.replace('&', ' et ')
     clean_text = clean_text.replace('=', ' égal ')
     clean_text = clean_text.replace('+', ' plus ')
-    clean_text = clean_text.replace('-', ' moins ')
     
     # Remplacer les chiffres ordinaux par leur forme prononcée
     ordinals = {
@@ -480,6 +503,9 @@ def clean_text_for_audio(text):
     # Nettoyer les doubles espaces
     while '  ' in clean_text:
         clean_text = clean_text.replace('  ', ' ')
+    
+    # Ajouter des points entre les phrases pour améliorer la diction
+    clean_text = re.sub(r'([.!?])\s+', r'\1 ', clean_text)
     
     return clean_text
 
@@ -801,6 +827,32 @@ def start_video_check_scheduler(app):
 
 # --- Handlers Telegram ---
 
+async def handle_yt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Traite un lien YouTube explicitement envoyé via commande /yt"""
+    message_parts = update.message.text.split(" ", 1)
+    
+    if len(message_parts) < 2:
+        await update.message.reply_text(
+            "❗ Utilisation : `/yt [lien YouTube]`\n\n"
+            "Exemple : `/yt https://youtube.com/watch?v=VIDEO_ID`"
+        )
+        return
+    
+    url = message_parts[1].strip()
+    
+    # Vérifier si c'est un lien YouTube valide
+    if "youtube.com" not in url and "youtu.be" not in url:
+        await update.message.reply_text(
+            "❌ L'URL fournie n'est pas une URL YouTube valide."
+        )
+        return
+    
+    # On simule un message normal contenant uniquement l'URL
+    update.message.text = url
+    
+    # On appelle le handler standard pour le traitement
+    await handle_message(update, context)
+
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     CHAT_ACTIVE[user_id] = True
@@ -840,183 +892,219 @@ async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    message_text = update.message.text
-    
-    # Vérifier si le mode chat est actif
-    if user_id in CHAT_ACTIVE and CHAT_ACTIVE[user_id]:
-        # Ajouter le message de l'utilisateur à l'historique
-        if user_id not in CONVERSATION_HISTORY:
-            CONVERSATION_HISTORY[user_id] = []
-        
-        CONVERSATION_HISTORY[user_id].append({"role": "user", "content": message_text})
-        
-        # Si le message contient un lien YouTube, on récupère les sous-titres
-        video_id = extract_video_id(message_text)
-        context_content = ""
-        
-        if video_id:
-            subtitles, error = get_subtitles(message_text)
-            if error:
-                await update.message.reply_text(error)
-                return
-            context_content = f"Sous-titres de la vidéo : {subtitles}"
-        
-        # Construire les messages pour l'IA
-        messages = [
-            {"role": "system", "content": f"Tu es un assistant qui aide à comprendre et analyser des vidéos YouTube. {context_content}"}
-        ]
-        
-        # Ajouter l'historique de conversation limitée aux 10 derniers messages
-        messages.extend(CONVERSATION_HISTORY[user_id][-10:])
-        
-        # Obtenir la réponse
-        response = chat_with_lmstudio(messages)
-        
-        # Nettoyer la réponse des marqueurs Markdown
-        clean_response = sanitize_markdown(response)
-        
-        # Ajouter la réponse à l'historique
-        CONVERSATION_HISTORY[user_id].append({"role": "assistant", "content": clean_response})
-        
-        # Envoyer la réponse sans formater en Markdown, en gérant les messages longs
-        await send_long_message(context.bot, chat_id=update.effective_chat.id, text=clean_response)
-        return
-    
-    # Comportement normal (non-chat) : traitement des liens YouTube
-    # Rechercher tous les liens YouTube dans le message
-    youtube_links = []
-    words = message_text.split()
-    
-    for word in words:
-        if "youtube.com" in word or "youtu.be" in word:
-            if extract_video_id(word):
-                youtube_links.append(word)
-    
-    if not youtube_links:
-        await update.message.reply_text("Aucun lien YouTube valide trouvé dans votre message.")
-        return
-    
-    # Limiter le nombre de liens à traiter à la fois pour éviter les timeouts
-    max_links = 6  # Limiter à 6 vidéos par message (augmenté de 3 à 6)
-    if len(youtube_links) > max_links:
-        await update.message.reply_text(
-            f"⚠️ Attention: Vous avez envoyé {len(youtube_links)} liens, mais je vais traiter seulement les {max_links} premiers pour éviter des problèmes de timeout.\n"
-            f"Pour traiter plus de vidéos, envoyez-les en plusieurs messages."
-        )
-        youtube_links = youtube_links[:max_links]
-    
-    # Message initial pour informer l'utilisateur
-    status_message = await update.message.reply_text(
-        f"🔍 J'ai trouvé {len(youtube_links)} liens YouTube. Je vais les traiter un par un..."
-    )
-    
-    # Traiter chaque lien YouTube séparément
-    for i, url in enumerate(youtube_links):
-        try:
-            # Mise à jour du message de statut
-            await status_message.edit_text(
-                f"⏳ Traitement du lien {i+1}/{len(youtube_links)}: {url}"
-            )
-            
-            # Récupérer les sous-titres
-            subtitles, error = get_subtitles(url)
-            if error:
-                await update.message.reply_text(f"❌ Erreur pour {url}: {error}")
-                # Attendre un peu avant de passer au lien suivant
-                await asyncio.sleep(1)
-                continue
-            
-            # Générer le résumé
-            summary = summarize(subtitles)
-            
-            # Double nettoyage pour garantir l'absence de caractères spéciaux
-            clean_summary = sanitize_markdown(sanitize_markdown(summary))
-            
-            # Vérifier qu'il n'y a pas d'entités HTML non décodées
-            if '&' in clean_summary and (';' in clean_summary):
-                # Log du problème
-                print(f"Attention: Possible entité HTML non décodée dans le résumé {i+1}")
-                # Nettoyage agressif - supprimer les séquences problématiques
-                import re
-                clean_summary = re.sub(r'&[#\w]+;', '', clean_summary)
-            
-            try:
-                # Envoyer le résumé texte en gérant les messages longs
-                message_text = f"📝 Résumé de {url} :\n\n{clean_summary}"
-                await send_long_message(context.bot, chat_id=update.effective_chat.id, text=message_text)
-                
-                # Attendre un peu pour éviter de submerger l'API Telegram
-                await asyncio.sleep(4)  # Augmenté de 2 à 4 secondes
-                
-                # Créer et envoyer l'audio (texte_to_audio va maintenant nettoyer le texte automatiquement)
-                audio_path = text_to_audio(summary, f"resume_{i+1}.mp3")
-                
-                try:
-                    with open(audio_path, 'rb') as audio_file:
-                        await update.message.reply_voice(
-                            voice=audio_file,
-                            caption=f"🎙️ Résumé audio de la vidéo {i+1}/{len(youtube_links)}"
-                        )
-                    
-                    # Attendre un peu entre chaque envoi pour éviter les timeouts
-                    await asyncio.sleep(4)  # Augmenté de 2 à 4 secondes
-                except telegram.error.TimedOut:
-                    # Augmenter le nombre de tentatives pour l'envoi audio
-                    retry_count = 0
-                    max_audio_retries = 3
-                    
-                    while retry_count < max_audio_retries:
-                        try:
-                            retry_count += 1
-                            print(f"Tentative {retry_count} d'envoi de l'audio pour la vidéo {i+1}")
-                            await asyncio.sleep(3 * retry_count)  # Attente progressive
-                            
-                            with open(audio_path, 'rb') as audio_file:
-                                await update.message.reply_voice(
-                                    voice=audio_file,
-                                    caption=f"🎙️ Résumé audio de la vidéo {i+1}/{len(youtube_links)} (tentative {retry_count})"
-                                )
-                            break  # Sortir de la boucle si réussi
-                        except telegram.error.TimedOut:
-                            if retry_count >= max_audio_retries:
-                                await update.message.reply_text(
-                                    f"⚠️ L'envoi de l'audio a échoué après {max_audio_retries} tentatives. "
-                                    f"Le fichier est probablement trop volumineux pour Telegram."
-                                )
-                            # Sinon continuer avec la prochaine tentative
-                finally:
-                    # Supprimer le fichier audio après l'envoi (même en cas d'erreur)
-                    if os.path.exists(audio_path):
-                        os.remove(audio_path)
-            
-            except Exception as e:
-                print(f"Erreur lors du traitement de {url}: {str(e)}")
-                await update.message.reply_text(f"❌ Erreur lors du traitement de {url}: {str(e)}")
-                # Continuer avec le prochain lien même en cas d'erreur
-                await asyncio.sleep(2)  # Augmenté de 1 à 2 secondes
-                continue
-        
-        except telegram.error.TimedOut:
-            # Gérer spécifiquement les timeouts de Telegram
-            await update.message.reply_text(
-                f"⚠️ Le traitement de {url} a pris trop de temps et Telegram a interrompu la connexion. "
-                f"Je passe au lien suivant."
-            )
-            await asyncio.sleep(5)  # Augmenté de 3 à 5 secondes
-            continue
-        except Exception as e:
-            print(f"Erreur inattendue lors du traitement de {url}: {str(e)}")
-            await update.message.reply_text(f"❌ Erreur inattendue: {str(e)}")
-            await asyncio.sleep(1)
-            continue
-    
-    # Mise à jour du message de statut final
     try:
-        await status_message.edit_text(f"✅ Traitement terminé pour {len(youtube_links)} vidéos YouTube.")
-    except:
-        # Si le message a été supprimé ou ne peut pas être édité
-        pass
+        user_id = update.effective_user.id
+        message_text = update.message.text or ""
+        
+        # Obtenir l'ID du chat (salon) où le message a été envoyé
+        chat_id = update.effective_chat.id
+        
+        # Obtenir l'ID du thread/topic si le message est dans un salon de discussion
+        thread_id = update.message.message_thread_id if hasattr(update.message, 'message_thread_id') else None
+        
+        # Log pour le débogage
+        chat_type = update.effective_chat.type
+        chat_title = getattr(update.effective_chat, 'title', 'Chat privé')
+        print(f"\nMessage reçu dans {chat_type} (ID: {chat_id}): {message_text[:50]}...")
+        if thread_id:
+            print(f"Message dans le salon/thread ID: {thread_id}")
+        
+        # Préparer les paramètres de réponse pour envoyer au bon endroit
+        reply_params = {"chat_id": chat_id}
+        if thread_id:
+            reply_params["message_thread_id"] = thread_id
+        
+        # Vérifier si le mode chat est actif
+        if user_id in CHAT_ACTIVE and CHAT_ACTIVE[user_id]:
+            # Ajouter le message de l'utilisateur à l'historique
+            if user_id not in CONVERSATION_HISTORY:
+                CONVERSATION_HISTORY[user_id] = []
+            
+            CONVERSATION_HISTORY[user_id].append({"role": "user", "content": message_text})
+            
+            # Si le message contient un lien YouTube, on récupère les sous-titres
+            video_id = extract_video_id(message_text)
+            context_content = ""
+            
+            if video_id:
+                subtitles, error = get_subtitles(message_text)
+                if error:
+                    await context.bot.send_message(text=error, **reply_params)
+                    return
+                context_content = f"Sous-titres de la vidéo : {subtitles}"
+            
+            # Construire les messages pour l'IA
+            messages = [
+                {"role": "system", "content": f"Tu es un assistant qui aide à comprendre et analyser des vidéos YouTube. {context_content}"}
+            ]
+            
+            # Ajouter l'historique de conversation limitée aux 10 derniers messages
+            messages.extend(CONVERSATION_HISTORY[user_id][-10:])
+            
+            # Obtenir la réponse
+            response = chat_with_lmstudio(messages)
+            
+            # Nettoyer la réponse des marqueurs Markdown
+            clean_response = sanitize_markdown(response)
+            
+            # Ajouter la réponse à l'historique
+            CONVERSATION_HISTORY[user_id].append({"role": "assistant", "content": clean_response})
+            
+            # Envoyer la réponse sans formater en Markdown, en gérant les messages longs
+            await send_long_message(context.bot, text=clean_response, **reply_params)
+            return
+        
+        # Comportement normal (non-chat) : traitement des liens YouTube
+        # Rechercher tous les liens YouTube dans le message
+        youtube_links = []
+        words = message_text.split()
+        
+        for word in words:
+            if "youtube.com" in word or "youtu.be" in word:
+                if extract_video_id(word):
+                    youtube_links.append(word)
+        
+        if not youtube_links:
+            # Ne rien faire si aucun lien YouTube n'est trouvé
+            return
+        
+        # Initialiser la structure de file d'attente pour ce chat s'il n'existe pas encore
+        if chat_id not in YOUTUBE_QUEUE:
+            YOUTUBE_QUEUE[chat_id] = {
+                "queue": [],
+                "processing": False,
+                "thread_id": thread_id
+            }
+        else:
+            # Mettre à jour l'ID du thread si nécessaire
+            YOUTUBE_QUEUE[chat_id]["thread_id"] = thread_id
+        
+        # Ajouter les liens à la file d'attente
+        for url in youtube_links:
+            if url not in YOUTUBE_QUEUE[chat_id]["queue"]:
+                YOUTUBE_QUEUE[chat_id]["queue"].append(url)
+        
+        # Informer l'utilisateur du nombre de liens ajoutés à la file d'attente
+        if YOUTUBE_QUEUE[chat_id]["processing"]:
+            await context.bot.send_message(
+                text=f"✅ {len(youtube_links)} lien(s) ajouté(s) à la file d'attente. Traitement en cours...",
+                **reply_params
+            )
+        else:
+            await context.bot.send_message(
+                text=f"✅ {len(youtube_links)} lien(s) à traiter...",
+                **reply_params
+            )
+            # Démarrer le traitement si aucun n'est en cours
+            await process_youtube_queue(chat_id, context)
+            
+    except Exception as e:
+        print(f"Erreur lors du traitement du message: {str(e)}")
+        try:
+            await update.message.reply_text(f"❌ Erreur lors du traitement du message: {str(e)}")
+        except:
+            pass
+
+async def process_youtube_queue(chat_id, context):
+    """Traite la file d'attente des liens YouTube pour un chat spécifique"""
+    if chat_id not in YOUTUBE_QUEUE or not YOUTUBE_QUEUE[chat_id]["queue"]:
+        return
+    
+    # Marquer comme en cours de traitement
+    YOUTUBE_QUEUE[chat_id]["processing"] = True
+    thread_id = YOUTUBE_QUEUE[chat_id]["thread_id"]
+    
+    # Préparer les paramètres de réponse
+    reply_params = {"chat_id": chat_id}
+    if thread_id:
+        reply_params["message_thread_id"] = thread_id
+    
+    # Récupérer le prochain lien à traiter
+    url = YOUTUBE_QUEUE[chat_id]["queue"].pop(0)
+    
+    try:
+        # Informer l'utilisateur
+        if len(YOUTUBE_QUEUE[chat_id]["queue"]) > 0:
+            await context.bot.send_message(
+                text=f"🔄 Traitement du lien: {url}\n({len(YOUTUBE_QUEUE[chat_id]['queue'])} liens en attente)",
+                **reply_params
+            )
+        else:
+            await context.bot.send_message(
+                text=f"🔄 Traitement du lien: {url}",
+                **reply_params
+            )
+        
+        # Récupérer les sous-titres
+        subtitles, error = get_subtitles(url)
+        if error:
+            await context.bot.send_message(text=f"❌ Erreur pour {url}: {error}", **reply_params)
+            
+            # Passer au lien suivant s'il y en a
+            YOUTUBE_QUEUE[chat_id]["processing"] = False
+            await process_youtube_queue(chat_id, context)
+            return
+        
+        # Générer le résumé
+        summary = summarize(subtitles)
+        
+        # Double nettoyage pour garantir l'absence de caractères spéciaux
+        clean_summary = sanitize_markdown(sanitize_markdown(summary))
+        
+        # Vérifier qu'il n'y a pas d'entités HTML non décodées
+        if '&' in clean_summary and (';' in clean_summary):
+            # Log du problème
+            print(f"Attention: Possible entité HTML non décodée dans le résumé")
+            # Nettoyage agressif - supprimer les séquences problématiques
+            import re
+            clean_summary = re.sub(r'&[#\w]+;', '', clean_summary)
+        
+        # Envoyer le résumé texte
+        message_text = f"📝 Résumé de {url} :\n\n{clean_summary}"
+        await send_long_message(context.bot, text=message_text, **reply_params)
+        
+        # Attendre un peu pour éviter de submerger l'API Telegram
+        await asyncio.sleep(4)
+        
+        # Créer et envoyer l'audio
+        audio_path = text_to_audio(summary, f"resume_queue.mp3")
+        
+        try:
+            with open(audio_path, 'rb') as audio_file:
+                if thread_id:
+                    await context.bot.send_voice(
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        voice=audio_file,
+                        caption=f"🎙️ Résumé audio"
+                    )
+                else:
+                    await context.bot.send_voice(
+                        chat_id=chat_id,
+                        voice=audio_file,
+                        caption=f"🎙️ Résumé audio"
+                    )
+        except Exception as e:
+            await context.bot.send_message(
+                text=f"⚠️ Erreur lors de l'envoi de l'audio: {str(e)}",
+                **reply_params
+            )
+        finally:
+            # Supprimer le fichier audio
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+    
+    except Exception as e:
+        # En cas d'erreur, informer l'utilisateur
+        print(f"Erreur lors du traitement de {url}: {str(e)}")
+        await context.bot.send_message(
+            text=f"❌ Erreur lors du traitement de {url}: {str(e)}",
+            **reply_params
+        )
+    
+    # Marquer comme terminé et passer au lien suivant s'il y en a
+    YOUTUBE_QUEUE[chat_id]["processing"] = False
+    await process_youtube_queue(chat_id, context)
 
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text
@@ -1109,6 +1197,7 @@ Ce bot vous permet d'interagir avec des vidéos YouTube de façon intelligente.
 
 Résumé et questions :
 • Envoyez un lien YouTube pour obtenir un résumé
+• /yt - Traiter explicitement un lien YouTube
 • /question ou /q - Poser une question sur une vidéo
 
 Mode conversation :
@@ -1125,6 +1214,11 @@ Abonnements :
 1. Résumé : envoyez simplement un lien YouTube
 2. Question : /q https://youtube.com/watch?v=VIDEO_ID Quelle est la conclusion ?
 3. Abonnement : /sub https://www.youtube.com/@NomDeLaChaine
+
+📢 Utilisation dans les groupes :
+• Mentionnez le bot avec @nomdubot avant ou après le lien YouTube
+• Utilisez /yt pour traiter directement un lien
+• Répondez à un message du bot avec un lien YouTube
 """
     await update.message.reply_text(help_text)
 
@@ -1343,21 +1437,25 @@ def split_message_for_telegram(text, max_length=4000):
     
     return parts
 
-async def send_long_message(bot, chat_id, text, **kwargs):
+async def send_long_message(bot, text, **kwargs):
     """
     Envoie un message potentiellement long en le divisant si nécessaire.
     Gère les timeouts et ajoute des délais entre les messages pour éviter les erreurs Telegram.
     
     Args:
         bot: L'instance du bot Telegram
-        chat_id: L'ID du chat où envoyer le message
         text: Le texte du message
-        **kwargs: Arguments supplémentaires pour send_message
+        **kwargs: Arguments supplémentaires pour send_message (comme chat_id, message_thread_id)
         
     Returns:
         Le dernier message envoyé
     """
     if not text:
+        return None
+        
+    # S'assurer que chat_id est dans les kwargs
+    if 'chat_id' not in kwargs:
+        print("Erreur: chat_id manquant dans send_long_message")
         return None
         
     # Diviser le message si nécessaire
@@ -1384,8 +1482,8 @@ async def send_long_message(bot, chat_id, text, **kwargs):
                     wait_time = min(2 + (len(part) / 1500), 5)
                     await asyncio.sleep(wait_time)
                     
-                # Envoyer le message
-                last_message = await bot.send_message(chat_id=chat_id, text=part, **kwargs)
+                # Envoyer le message avec tous les paramètres fournis
+                last_message = await bot.send_message(text=part, **kwargs)
                 break  # Sortir de la boucle si l'envoi a réussi
                 
             except telegram.error.TimedOut:
@@ -1399,7 +1497,7 @@ async def send_long_message(bot, chat_id, text, **kwargs):
                     # Essayer d'envoyer un message plus court
                     try:
                         error_msg = f"[Une partie du message n'a pas pu être envoyée en raison d'un timeout. Partie {i+1}/{len(message_parts)}]"
-                        last_message = await bot.send_message(chat_id=chat_id, text=error_msg)
+                        last_message = await bot.send_message(text=error_msg, **kwargs)
                     except:
                         pass
                 else:
@@ -1412,7 +1510,7 @@ async def send_long_message(bot, chat_id, text, **kwargs):
                 # Essayer avec un message plus simple
                 try:
                     error_msg = f"[Impossible d'afficher une partie du message. Erreur: {str(e)}]"
-                    last_message = await bot.send_message(chat_id=chat_id, text=error_msg)
+                    last_message = await bot.send_message(text=error_msg, **kwargs)
                 except:
                     pass
                     
@@ -1477,14 +1575,31 @@ if __name__ == '__main__':
     # Charger les abonnements existants
     load_subscriptions()
     
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
+    # Créer l'application avec des paramètres optimisés pour les groupes
+    builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
+    
+    # Configurer des timeouts plus longs
+    builder.connection_pool_size(8)
+    builder.connect_timeout(30.0)
+    builder.read_timeout(30.0)
+    builder.write_timeout(30.0)
+    
+    # Construire l'application
+    app = builder.build()
+    
+    # Afficher un message pour confirmer le bon démarrage
+    print("\n=== DÉMARRAGE DU BOT ===")
+    print(f"Token: {TELEGRAM_TOKEN[:5]}...{TELEGRAM_TOKEN[-5:]}")
+    
     # Handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Handler principal
     app.add_handler(CommandHandler("question", handle_question))
     app.add_handler(CommandHandler("q", handle_question))  # Alias court pour question
+    
+    # Commande pour traiter directement un lien YouTube
+    app.add_handler(CommandHandler("yt", handle_yt))
     
     # Commandes d'aide et de démarrage
     app.add_handler(CommandHandler("help", handle_help))
@@ -1515,6 +1630,18 @@ if __name__ == '__main__':
     else:
         print("⚠️ Planificateur non disponible, vérification automatique désactivée")
     
+    # Information importante sur la configuration des groupes
+    print("\n=== INFORMATION IMPORTANTE ===")
+    print("Pour que le bot fonctionne correctement dans les groupes :")
+    print("1. Ajoutez le bot comme administrateur du groupe")
+    print("   OU")
+    print("2. Désactivez le mode Privacy via @BotFather :")
+    print("   /mybots > [votre bot] > Bot Settings > Group Privacy > Turn off")
+    print("\nCommandes disponibles : /start, /help, /yt")
+    print("==============================\n")
+    
     # Démarrage du bot
-    print("Bot démarré !")
-    app.run_polling()
+    print("🚀 Bot démarré ! Utilisez Ctrl+C pour arrêter.")
+    
+    # Activer tous les types de mises à jour pour une meilleure compatibilité
+    app.run_polling(allowed_updates=telegram.Update.ALL_TYPES)
