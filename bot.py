@@ -129,7 +129,7 @@ def get_subtitles(video_url):
     except Exception as e:
         return None, f"[Erreur récupération sous-titres] {str(e)}"
 
-def split_text(text, max_chars=12000):
+def split_text(text, max_chars=6000):
     """
     Divise un texte en parties plus petites en essayant de respecter les phrases.
     
@@ -145,6 +145,22 @@ def split_text(text, max_chars=12000):
     # Si le texte est déjà assez court, le retourner tel quel
     if len(text) <= max_chars:
         return [text]
+    
+    # Estimer le nombre de tokens (règle approximative: environ 4 caractères par token)
+    estimated_tokens = len(text) / 4
+    
+    # Si le texte est très long (dépasse la limite de contexte du modèle), réduire encore plus la taille
+    context_limit = int(os.getenv("LM_CONTEXT_LENGTH", "4096"))
+    if estimated_tokens > context_limit:
+        # Calculer un facteur de réduction pour respecter la limite de contexte
+        # Utiliser 75% de la limite pour laisser de la place aux instructions et à la réponse
+        safe_limit = int(context_limit * 0.75)
+        # Calculer la taille de chunk maximale en caractères
+        adjusted_max_chars = int((safe_limit / estimated_tokens) * len(text))
+        # Limiter à un minimum de 1000 caractères et un maximum de max_chars original
+        adjusted_max_chars = max(1000, min(adjusted_max_chars, max_chars))
+        print(f"Texte très long détecté ({estimated_tokens:.0f} tokens estimés). Ajustement de la taille maximale à {adjusted_max_chars} caractères")
+        max_chars = adjusted_max_chars
         
     parts = []
     remaining_text = text
@@ -270,39 +286,107 @@ def summarize(text):
 
         print(f"Traitement de {len(chunks)} chunks pour résumé...")
         
-        for i, chunk in enumerate(chunks):
-            try:
-                print(f"Résumé du chunk {i+1}/{len(chunks)} (taille: {len(chunk)} caractères)")
-                messages = [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": chunk}
-                ]
-                
-                # Obtenir le résumé pour ce chunk
-                chunk_summary = chat_with_lmstudio(messages)
-                
-                # Nettoyer immédiatement le résumé
-                chunk_summary = sanitize_markdown(chunk_summary)
-                
-                # Vérifier si le résumé contient une erreur
-                if chunk_summary.startswith("[Erreur"):
-                    print(f"Erreur lors du résumé du chunk {i+1}: {chunk_summary}")
-                    # En cas d'erreur, simplifier la demande pour ce chunk
-                    simplified_messages = [
-                        {"role": "system", "content": "Résume ce texte simplement sans formatage, en commençant par un titre suivi d'un tiret."},
-                        {"role": "user", "content": chunk[:max_chunk_size // 2]}  # Utiliser moitié moins de texte
+        # Pour les vidéos très longues, on peut avoir un nombre important de chunks
+        if len(chunks) > 15:
+            print(f"Vidéo très longue détectée ({len(chunks)} chunks). Utilisation d'une stratégie de résumé progressive.")
+            
+            # Première étape: résumer les chunks individuellement
+            batch_summaries = []
+            for i, chunk in enumerate(chunks):
+                try:
+                    print(f"Résumé du chunk {i+1}/{len(chunks)} (taille: {len(chunk)} caractères)")
+                    messages = [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": chunk}
                     ]
-                    chunk_summary = chat_with_lmstudio(simplified_messages)
+                    
+                    # Obtenir le résumé pour ce chunk
+                    chunk_summary = chat_with_lmstudio(messages)
                     chunk_summary = sanitize_markdown(chunk_summary)
                     
-                # Si toujours en erreur, utiliser un résumé générique
-                if chunk_summary.startswith("[Erreur"):
-                    chunk_summary = f"[Contenu du segment {i+1}]"
+                    # Vérifier si le résumé contient une erreur
+                    if chunk_summary.startswith("[Erreur"):
+                        print(f"Erreur lors du résumé du chunk {i+1}: {chunk_summary}")
+                        # En cas d'erreur, simplifier la demande pour ce chunk
+                        simplified_messages = [
+                            {"role": "system", "content": "Résume ce texte simplement sans formatage, en quelques phrases clés."},
+                            {"role": "user", "content": chunk[:len(chunk) // 2]}  # Utiliser moitié moins de texte
+                        ]
+                        chunk_summary = chat_with_lmstudio(simplified_messages)
+                        chunk_summary = sanitize_markdown(chunk_summary)
+                    
+                    # Si toujours en erreur, utiliser un résumé générique
+                    if chunk_summary.startswith("[Erreur"):
+                        chunk_summary = f"[Contenu du segment {i+1} non traité]"
+                    
+                    batch_summaries.append(chunk_summary)
+                except Exception as e:
+                    print(f"Erreur lors du traitement du chunk {i+1}: {str(e)}")
+                    batch_summaries.append(f"[Erreur dans le segment {i+1}]")
+            
+            # Deuxième étape: regrouper les résumés par lots de 5-7 et les fusionner
+            intermediate_summaries = []
+            batch_size = min(6, max(3, len(batch_summaries) // 5))  # Taille de lot dynamique
+            
+            for i in range(0, len(batch_summaries), batch_size):
+                batch = batch_summaries[i:i+batch_size]
+                batch_text = "\n\n".join([f"Section {i+j+1}: {summary}" for j, summary in enumerate(batch)])
                 
-                summaries.append(chunk_summary)
-            except Exception as e:
-                print(f"Erreur lors du traitement du chunk {i+1}: {str(e)}")
-                summaries.append(f"[Erreur dans le segment {i+1}: {str(e)}]")
+                fusion_message = [
+                    {"role": "system", "content": "Fusionne ces résumés partiels en un seul résumé cohérent sans formatage. Garde les points clés principaux uniquement."},
+                    {"role": "user", "content": batch_text}
+                ]
+                
+                try:
+                    batch_summary = chat_with_lmstudio(fusion_message)
+                    batch_summary = sanitize_markdown(batch_summary)
+                    
+                    if batch_summary.startswith("[Erreur"):
+                        print(f"Erreur lors de la fusion du lot {i//batch_size + 1}: {batch_summary}")
+                        batch_summary = f"[Résumé des sections {i+1} à {min(i+batch_size, len(batch_summaries))} non disponible]"
+                    
+                    intermediate_summaries.append(batch_summary)
+                except Exception as e:
+                    print(f"Erreur lors de la fusion du lot {i//batch_size + 1}: {str(e)}")
+                    intermediate_summaries.append(f"[Erreur dans la fusion du lot {i//batch_size + 1}]")
+            
+            # Troisième étape: fusion finale des résumés intermédiaires
+            summaries = intermediate_summaries
+        else:
+            # Stratégie standard pour les vidéos de taille normale
+            for i, chunk in enumerate(chunks):
+                try:
+                    print(f"Résumé du chunk {i+1}/{len(chunks)} (taille: {len(chunk)} caractères)")
+                    messages = [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": chunk}
+                    ]
+                    
+                    # Obtenir le résumé pour ce chunk
+                    chunk_summary = chat_with_lmstudio(messages)
+                    
+                    # Nettoyer immédiatement le résumé
+                    chunk_summary = sanitize_markdown(chunk_summary)
+                    
+                    # Vérifier si le résumé contient une erreur
+                    if chunk_summary.startswith("[Erreur"):
+                        print(f"Erreur lors du résumé du chunk {i+1}: {chunk_summary}")
+                        # En cas d'erreur, simplifier la demande pour ce chunk
+                        simplified_messages = [
+                            {"role": "system", "content": "Résume ce texte simplement sans formatage, en commençant par un titre suivi d'un tiret."},
+                            {"role": "user", "content": chunk[:max_chunk_size // 2]}  # Utiliser moitié moins de texte
+                        ]
+                        chunk_summary = chat_with_lmstudio(simplified_messages)
+                        chunk_summary = sanitize_markdown(chunk_summary)
+                        
+                    # Si toujours en erreur, utiliser un résumé générique
+                    if chunk_summary.startswith("[Erreur"):
+                        chunk_summary = f"[Contenu du segment {i+1}]"
+                    
+                    summaries.append(chunk_summary)
+                except Exception as e:
+                    print(f"Erreur lors du traitement du chunk {i+1}: {str(e)}")
+                    summaries.append(f"[Erreur dans le segment {i+1}: {str(e)}]")
 
         # S'il n'y a qu'un seul résumé, pas besoin de fusion
         if len(summaries) == 1:
