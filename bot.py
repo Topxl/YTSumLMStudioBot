@@ -320,6 +320,33 @@ def extract_video_id(url):
             return clean_video_id
     return None
 
+def clean_subtitle_text_fallback(subtitle_content):
+    """Nettoyage basique des sous-titres comme fallback"""
+    try:
+        import re
+        import html
+        
+        print("🔄 Nettoyage basique des sous-titres (fallback)")
+        
+        # Nettoyage basique sans filtrage agressif
+        cleaned_text = html.unescape(subtitle_content)
+        cleaned_text = re.sub(r'<[^>]+>', '', cleaned_text)
+        cleaned_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned_text)
+        
+        # Supprimer seulement les métadonnées évidentes
+        cleaned_text = re.sub(r'"[a-zA-Z]+":[\s]*[0-9,\.\[\]{}"\s]+', '', cleaned_text)
+        cleaned_text = re.sub(r'\b(acAsrConf|tOffsetMs|dDurationMs|tStartMs)\b[^a-zA-Z]*[0-9]+', '', cleaned_text)
+        
+        # Nettoyer les espaces multiples
+        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+        
+        print(f"✅ Nettoyage basique effectué: {len(cleaned_text)} caractères")
+        return cleaned_text
+        
+    except Exception as e:
+        print(f"⚠️ Erreur lors du nettoyage basique: {e}")
+        return subtitle_content
+
 def clean_subtitle_text(subtitle_content):
     """Nettoie le contenu des sous-titres (XML, VTT, etc.) pour extraire le texte pur"""
     try:
@@ -419,23 +446,37 @@ def clean_subtitle_text(subtitle_content):
                         not line.startswith('"ac') and
                         not line.startswith('"t') and
                         not line.startswith('"d') and
-                        not '":' in line and
+                        not '": ' in line and  # Plus précis
                         not line.endswith(',') and
                         not line.endswith('}') and
-                        not line in ['{', '}', '[', ']']):
+                        not line in ['{', '}', '[', ']'] and
+                        not line.isdigit() and  # Ignorer les nombres seuls
+                        not re.match(r'^[0-9\.\,\:\;]+$', line)):  # Ignorer les séquences de ponctuation/nombres
                         # Nettoyer les guillemets et caractères JSON restants
                         line = re.sub(r'^"([^"]*)"$', r'\1', line)  # Enlever guillemets autour
                         line = line.replace('\\"', '"')  # Corriger les guillemets échappés
-                        if line and len(line) > 3:  # Ignorer les très courtes chaînes
+                        # Filtrer les lignes qui semblent être du vrai texte parlé
+                        if line and len(line) > 5 and re.search(r'[a-zA-ZÀ-ÿ]', line):  # Au moins une lettre
                             text_lines.append(line)
                 
                 cleaned_text = ' '.join(text_lines)
-                if cleaned_text:
+                if cleaned_text and len(cleaned_text) > 100:
                     print(f"✅ Métadonnées filtrées: {len(cleaned_text)} caractères")
+                    # Debug: afficher un échantillon du contenu filtré
+                    print(f"🔍 Échantillon du contenu filtré: {cleaned_text[:300]}...")
+                    
+                    # Vérifier si le contenu semble cohérent (au moins 10 mots)
+                    word_count = len(cleaned_text.split())
+                    if word_count < 10:
+                        print(f"⚠️ Contenu trop court après filtrage ({word_count} mots), utilisation du texte brut")
+                        # Fallback vers le nettoyage standard
+                        return clean_subtitle_text_fallback(subtitle_content)
+                    
                     return cleaned_text
                 else:
-                    print("❌ Impossible d'extraire le texte des métadonnées")
-                    return "Erreur: contenu principalement composé de métadonnées techniques"
+                    print("❌ Impossible d'extraire le texte des métadonnées, utilisation du texte brut")
+                    # Fallback vers le nettoyage standard  
+                    return clean_subtitle_text_fallback(subtitle_content)
             
             # Nettoyage standard pour les autres formats
             # Décoder les entités HTML au cas où
@@ -546,8 +587,8 @@ def translate_to_french(english_text):
             for i, chunk in enumerate(chunks):
                 print(f"   Traduction partie {i+1}/{len(chunks)}...")
                 messages = [
-                    {"role": "system", "content": "Tu es un traducteur professionnel. Traduis fidèlement ce texte anglais vers le français. Garde le sens et le style original. Ne traduis que le contenu, n'ajoute aucun commentaire."},
-                    {"role": "user", "content": f"Traduis ce texte en français :\n\n{chunk}"}
+                    {"role": "system", "content": "Traduis fidèlement ce texte anglais vers le français en gardant le sens original."},
+                    {"role": "user", "content": chunk}
                 ]
                 
                 translated_chunk = chat_with_lmstudio(messages)
@@ -563,8 +604,8 @@ def translate_to_french(english_text):
         else:
             # Traduction directe pour les textes courts
             messages = [
-                {"role": "system", "content": "Tu es un traducteur professionnel. Traduis fidèlement ce texte anglais vers le français. Garde le sens et le style original. Ne traduis que le contenu, n'ajoute aucun commentaire."},
-                {"role": "user", "content": f"Traduis ce texte en français :\n\n{english_text}"}
+                {"role": "system", "content": "Traduis fidèlement ce texte anglais vers le français en gardant le sens original."},
+                {"role": "user", "content": english_text}
             ]
             
             translated_text = chat_with_lmstudio(messages)
@@ -817,11 +858,11 @@ def summarize(text):
         summaries = []
 
         prompt = (
-            "Fais un résumé du contenu en français en apportant un maximum de valeur au lecteur. "
-            "Commence par un titre accrocheur en français qui résume le sujet principal, suivi d'un tiret. "
-            "Utilise des points clairs en français, sans répétition, et mets en avant les idées clés. "
-            "N'utilise pas de formatage Markdown comme les astérisques, les crochets ou autres caractères spéciaux. "
-            "IMPORTANT: Réponds uniquement en français, même si le contenu source était en anglais."
+            "Tu vas recevoir le contenu d'une vidéo YouTube. "
+            "Crée un résumé informatif en français qui commence par un titre accrocheur suivi d'un tiret. "
+            "Utilise des points clairs sans répétition et mets en avant les idées principales. "
+            "Pas de formatage Markdown (pas d'astérisques, crochets, etc.). "
+            "Écris ton résumé entièrement en français."
         )
 
         print(f"Traitement de {len(chunks)} chunks pour résumé...")
@@ -849,7 +890,7 @@ def summarize(text):
                         print(f"Erreur lors du résumé du chunk {i+1}: {chunk_summary}")
                         # En cas d'erreur, simplifier la demande pour ce chunk
                         simplified_messages = [
-                            {"role": "system", "content": "Résume ce texte en français simplement sans formatage, en quelques phrases clés."},
+                            {"role": "system", "content": "Résume simplement ce contenu de vidéo en quelques phrases clés en français, sans formatage."},
                             {"role": "user", "content": chunk[:len(chunk) // 2]}  # Utiliser moitié moins de texte
                         ]
                         chunk_summary = chat_with_lmstudio(simplified_messages)
@@ -873,7 +914,7 @@ def summarize(text):
                 batch_text = "\n\n".join([f"Section {i+j+1}: {summary}" for j, summary in enumerate(batch)])
                 
                 fusion_message = [
-                    {"role": "system", "content": "Fusionne ces résumés partiels en un seul résumé cohérent en français sans formatage. Garde les points clés principaux uniquement. Réponds uniquement en français."},
+                    {"role": "system", "content": "Combine ces résumés partiels de vidéo en un seul résumé cohérent en français. Garde seulement les points clés principaux, sans formatage."},
                     {"role": "user", "content": batch_text}
                 ]
                 
@@ -913,7 +954,7 @@ def summarize(text):
                         print(f"Erreur lors du résumé du chunk {i+1}: {chunk_summary}")
                         # En cas d'erreur, simplifier la demande pour ce chunk
                         simplified_messages = [
-                            {"role": "system", "content": "Résume ce texte en français simplement sans formatage, en commençant par un titre suivi d'un tiret. Réponds uniquement en français."},
+                            {"role": "system", "content": "Résume ce contenu de vidéo simplement en français, avec un titre suivi d'un tiret, sans formatage."},
                             {"role": "user", "content": chunk[:max_chunk_size // 2]}  # Utiliser moitié moins de texte
                         ]
                         chunk_summary = chat_with_lmstudio(simplified_messages)
