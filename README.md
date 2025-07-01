@@ -72,8 +72,10 @@ Le bot nécessite les variables d'environnement suivantes dans le fichier `.env`
 
 - `TELEGRAM_BOT_TOKEN` : Token de votre bot Telegram
 - `LM_API_URL` : URL de votre instance LM Studio (ex: http://localhost:1234)
-- `LM_MODEL_NAME` : Nom du modèle à utiliser
+
 - `YOUTUBE_API_KEY` : (Optionnel) Clé API YouTube pour les abonnements
+
+
 
 ## Utilisation
 

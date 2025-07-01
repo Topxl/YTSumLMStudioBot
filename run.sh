@@ -18,7 +18,7 @@ if [ ! -f .env ]; then
     if [ -f .env.example ]; then
         cp .env.example .env
         echo "✅ .env créé. Veuillez éditer ce fichier pour configurer vos variables d'environnement."
-        echo "   N'oubliez pas de définir TELEGRAM_BOT_TOKEN, LM_API_URL et LM_MODEL_NAME."
+        echo "   N'oubliez pas de définir TELEGRAM_BOT_TOKEN et LM_API_URL."
         exit 1
     else
         echo "❌ Impossible de trouver .env.example. Veuillez créer un fichier .env manuellement."

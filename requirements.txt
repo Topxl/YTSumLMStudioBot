@@ -1,5 +1,8 @@
-python-telegram-bot[job-queue]==20.8
+python-telegram-bot[job-queue]==20.7
+httpx>=0.25.2
 gtts
 python-dotenv
 youtube-transcript-api
 google-api-python-client
+yt-dlp
+requests

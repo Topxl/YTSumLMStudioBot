@@ -4,7 +4,8 @@ import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+import yt_dlp
 from gtts import gTTS
 import json
 import urllib.parse
@@ -13,12 +14,251 @@ from googleapiclient.discovery import build
 import time
 import asyncio
 import telegram
+import xml.etree.ElementTree as ET
 
 # --- Config ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LM_API_URL = os.getenv("LM_API_URL")
-LM_MODEL_NAME = os.getenv("LM_MODEL_NAME")
+
+# Variables globales pour stocker la configuration détectée automatiquement
+DETECTED_MODEL = None
+DETECTED_CONTEXT_LENGTH = None
+DETECTED_MAX_TOKENS = None
+
+# Fonction pour détecter automatiquement le modèle et sa configuration
+def detect_available_model():
+    """Détecte automatiquement le modèle disponible dans LM Studio"""
+    global DETECTED_MODEL
+    
+    if not LM_API_URL:
+        print("❌ Erreur: LM_API_URL non défini")
+        return None
+    
+    api_url = LM_API_URL.rstrip('/')
+    models_endpoint = f"{api_url}/v1/models"
+    
+    try:
+        print(f"🔍 Recherche des modèles disponibles sur {models_endpoint}")
+        response = requests.get(models_endpoint, timeout=10)
+        
+        if response.status_code == 200:
+            models_data = response.json()
+            
+            if 'data' in models_data and len(models_data['data']) > 0:
+                # Prendre le premier modèle disponible
+                model_id = models_data['data'][0]['id']
+                DETECTED_MODEL = model_id
+                print(f"✅ Modèle détecté automatiquement: {model_id}")
+                
+                # Détecter la configuration du modèle
+                detect_model_configuration(model_id)
+                return model_id
+            else:
+                print("❌ Aucun modèle trouvé dans la réponse")
+                return None
+        else:
+            print(f"❌ Erreur lors de la récupération des modèles: {response.status_code}")
+            return None
+            
+    except requests.exceptions.ConnectionError:
+        print("❌ Erreur de connexion: Impossible de se connecter à LM Studio")
+        return None
+    except Exception as e:
+        print(f"❌ Erreur lors de la détection du modèle: {str(e)}")
+        return None
+
+def detect_model_configuration(model_id):
+    """Détecte automatiquement la configuration du modèle (contexte, max tokens)"""
+    global DETECTED_CONTEXT_LENGTH, DETECTED_MAX_TOKENS
+    
+    api_url = LM_API_URL.rstrip('/')
+    chat_endpoint = f"{api_url}/v1/chat/completions"
+    
+    try:
+        print(f"🔧 Détection avancée de la configuration du modèle {model_id}...")
+        
+        # Tests progressifs pour trouver la vraie limite
+        test_sizes = [
+            (500, "Test court. " * 50),        # ~500 tokens
+            (2000, "Test moyen. " * 200),      # ~2000 tokens  
+            (4000, "Test long. " * 400),       # ~4000 tokens
+            (8000, "Test très long. " * 800),  # ~8000 tokens
+            (12000, "Test énorme. " * 1200),   # ~12000 tokens
+            (16000, "Test géant. " * 1600),    # ~16000 tokens
+            (20000, "Test massif. " * 2000),   # ~20000 tokens
+            (32000, "Test colossal. " * 3200), # ~32000 tokens
+            (50000, "Test titanesque. " * 5000), # ~50000 tokens
+            (75000, "Test gigantesque. " * 7500), # ~75000 tokens
+            (100000, "Test astronomique. " * 10000), # ~100000 tokens
+        ]
+        
+        max_working_size = 500  # Au minimum 500 tokens
+        
+        for expected_tokens, test_content in test_sizes:
+            payload = {
+                "model": model_id,
+                "messages": [{"role": "user", "content": test_content}],
+                "max_tokens": 10,  # Très peu pour la réponse
+                "temperature": 0.1
+            }
+            
+            print(f"   🧪 Test avec ~{expected_tokens} tokens...", end="")
+            # Timeout plus long pour les gros tests
+            timeout = 30 if expected_tokens > 50000 else 20 if expected_tokens > 20000 else 15
+            response = requests.post(chat_endpoint, json=payload, timeout=timeout)
+            
+            if response.status_code == 200:
+                max_working_size = expected_tokens
+                print(" ✅")
+            else:
+                print(" ❌")
+                # Analyser l'erreur pour comprendre la limite exacte
+                error_text = response.text.lower()
+                if "context" in error_text:
+                    # Chercher des nombres dans l'erreur pour extraire la limite réelle
+                    import re
+                    numbers = re.findall(r'\b(\d+)\b', error_text)
+                    if numbers:
+                        # Prendre le plus grand nombre trouvé comme limite probable
+                        context_limits = [int(n) for n in numbers if int(n) > 1000]
+                        if context_limits:
+                            detected_limit = max(context_limits)
+                            print(f"   📊 Limite détectée dans l'erreur: {detected_limit} tokens")
+                            # Utiliser 80% de la limite détectée pour la sécurité
+                            max_working_size = min(max_working_size, int(detected_limit * 0.8))
+                break
+        
+        # Définir la configuration basée sur la taille maximale qui fonctionne
+        if max_working_size >= 75000:
+            DETECTED_CONTEXT_LENGTH = 90000  # Pour les modèles astronomiques (100k+)
+            DETECTED_MAX_TOKENS = 8000
+            print(f"✅ Modèle astronomique détecté:")
+        elif max_working_size >= 50000:
+            DETECTED_CONTEXT_LENGTH = 60000  # Pour les modèles titanesques (75k+)
+            DETECTED_MAX_TOKENS = 6000
+            print(f"✅ Modèle titanesque détecté:")
+        elif max_working_size >= 32000:
+            DETECTED_CONTEXT_LENGTH = 40000  # Pour les modèles colossaux (50k+)
+            DETECTED_MAX_TOKENS = 4000
+            print(f"✅ Modèle colossal détecté:")
+        elif max_working_size >= 20000:
+            DETECTED_CONTEXT_LENGTH = 16000  # Pour les modèles massifs (conservative)
+            DETECTED_MAX_TOKENS = 2000
+            print(f"✅ Modèle massif détecté:")
+        elif max_working_size >= 16000:
+            DETECTED_CONTEXT_LENGTH = 12000  # Pour les modèles géants (conservative)
+            DETECTED_MAX_TOKENS = 1500
+            print(f"✅ Modèle géant détecté:")
+        elif max_working_size >= 12000:
+            DETECTED_CONTEXT_LENGTH = 15000  # Pour les très gros modèles (16k+)
+            DETECTED_MAX_TOKENS = 2000
+            print(f"✅ Modèle haute capacité détecté:")
+        elif max_working_size >= 8000:
+            DETECTED_CONTEXT_LENGTH = 10000  # Pour les gros modèles (12k+)
+            DETECTED_MAX_TOKENS = 1500
+            print(f"✅ Modèle grande capacité détecté:")
+        elif max_working_size >= 4000:
+            DETECTED_CONTEXT_LENGTH = 6000   # Pour les modèles moyens-hauts (8k+)
+            DETECTED_MAX_TOKENS = 1000
+            print(f"✅ Modèle moyenne-haute capacité détecté:")
+        elif max_working_size >= 2000:
+            DETECTED_CONTEXT_LENGTH = 3000   # Pour les modèles moyens (4k+)
+            DETECTED_MAX_TOKENS = 800
+            print(f"✅ Modèle moyenne capacité détecté:")
+        else:
+            DETECTED_CONTEXT_LENGTH = 1500   # Pour les petits modèles
+            DETECTED_MAX_TOKENS = 400
+            print(f"✅ Modèle petite capacité détecté:")
+            
+        print(f"   📏 Contexte utilisé: {DETECTED_CONTEXT_LENGTH} tokens (testé jusqu'à {max_working_size})")
+        print(f"   📝 Max tokens: {DETECTED_MAX_TOKENS}")
+            
+    except Exception as e:
+        # Valeurs par défaut très conservatrices en cas d'erreur
+        DETECTED_CONTEXT_LENGTH = 8000
+        DETECTED_MAX_TOKENS = 1000
+        print(f"❌ Erreur lors de la détection de configuration: {str(e)}")
+        print(f"⚠️ Utilisation des valeurs par défaut:")
+        print(f"   📏 Contexte: {DETECTED_CONTEXT_LENGTH} tokens")
+        print(f"   📝 Max tokens: {DETECTED_MAX_TOKENS}")
+
+def get_adaptive_chunk_size():
+    """Retourne la taille de chunk adaptée à la configuration détectée"""
+    if DETECTED_CONTEXT_LENGTH:
+        # Adapter la taille des chunks selon la vraie capacité du modèle
+        
+        if DETECTED_CONTEXT_LENGTH >= 90000:
+            # Pour les modèles astronomiques (90k+ tokens)
+            chunk_size = 150000  # Chunks astronomiques
+        elif DETECTED_CONTEXT_LENGTH >= 60000:
+            # Pour les modèles titanesques (60k-90k tokens)
+            chunk_size = 100000  # Chunks titanesques
+        elif DETECTED_CONTEXT_LENGTH >= 40000:
+            # Pour les modèles colossaux (40k-60k tokens)
+            chunk_size = 70000   # Chunks colossaux
+        elif DETECTED_CONTEXT_LENGTH >= 25000:
+            # Pour les modèles massifs (25k-40k tokens)
+            chunk_size = 30000   # Chunks massifs (plus conservateur)
+        elif DETECTED_CONTEXT_LENGTH >= 16000:
+            # Pour les modèles massifs (16k-25k tokens)
+            chunk_size = 20000   # Chunks larges (plus conservateur)
+        elif DETECTED_CONTEXT_LENGTH >= 12000:
+            # Pour les modèles géants (12k-16k tokens)
+            chunk_size = 15000   # Chunks moyens (plus conservateur)
+        elif DETECTED_CONTEXT_LENGTH >= 15000:
+            # Pour les très gros modèles (15k-20k tokens)
+            chunk_size = 25000   # Chunks très larges
+        elif DETECTED_CONTEXT_LENGTH >= 10000:
+            # Pour les gros modèles (10k-15k tokens)
+            chunk_size = 18000   # Chunks larges
+        elif DETECTED_CONTEXT_LENGTH >= 6000:
+            # Pour les modèles moyens-hauts (6k-10k tokens)
+            chunk_size = 12000   # Chunks moyens-larges
+        elif DETECTED_CONTEXT_LENGTH >= 3000:
+            # Pour les modèles moyens (3k-6k tokens)
+            chunk_size = 8000    # Chunks moyens
+        elif DETECTED_CONTEXT_LENGTH >= 2000:
+            # Pour les modèles petits-moyens (2k-3k tokens)
+            chunk_size = 5000    # Chunks petits-moyens
+        else:
+            # Pour les petits modèles (moins de 2k tokens)
+            chunk_size = 3000    # Chunks petits
+        
+        print(f"📐 Taille de chunk adaptée: {chunk_size} caractères (contexte détecté: {DETECTED_CONTEXT_LENGTH} tokens)")
+        return chunk_size
+    else:
+        # Valeur par défaut plus conservatrice
+        print(f"📐 Taille de chunk par défaut: 12000 caractères (contexte non détecté)")
+        return 12000
+
+def test_lm_studio_connection():
+    """Teste la connexion avec LM Studio et détecte le modèle disponible"""
+    if not LM_API_URL:
+        return False
+    
+    # D'abord détecter le modèle disponible
+    model = detect_available_model()
+    if not model:
+        return False
+    
+    # Ensuite tester une requête simple
+    api_url = LM_API_URL.rstrip('/')
+    chat_endpoint = f"{api_url}/v1/chat/completions"
+    
+    try:
+        # Requête simple pour tester l'API
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Test"}],
+            "max_tokens": 5,
+            "temperature": 0.1
+        }
+        
+        response = requests.post(chat_endpoint, json=payload, timeout=10)
+        return response.status_code == 200
+    except:
+        return False
 
 # Fonction pour vérifier la disponibilité de LM Studio
 def check_lmstudio_availability():
@@ -27,48 +267,19 @@ def check_lmstudio_availability():
         print("❌ Erreur: LM_API_URL non défini dans le fichier .env")
         return False
     
-    if not LM_MODEL_NAME:
-        print("❌ Erreur: LM_MODEL_NAME non défini dans le fichier .env")
-        return False
-    
-    api_url = LM_API_URL.rstrip('/')
-    if not api_url.endswith('/v1/chat/completions'):
-        api_url = f"{api_url}/v1/chat/completions"
-    
-    print(f"🔍 Test de connexion à LM Studio sur {api_url}...")
-    
-    try:
-        # Requête simple pour tester l'API
-        payload = {
-            "model": LM_MODEL_NAME,
-            "messages": [{"role": "user", "content": "Test de connexion"}],
-            "max_tokens": 5,
-            "temperature": 0.1
-        }
-        
-        # Augmenter le timeout pour la vérification
-        response = requests.post(api_url, json=payload, timeout=30)  # Augmenté de 10 à 30 secondes
-        
-        if response.status_code == 200:
-            print("✅ Connexion à LM Studio réussie!")
-            return True
-        else:
-            print(f"❌ Erreur de connexion à LM Studio: {response.status_code} - {response.text}")
-            return False
-    except requests.exceptions.ConnectionError:
+    # Tester la connexion et détecter automatiquement le modèle
+    if test_lm_studio_connection():
+        print(f"✅ Connexion à LM Studio réussie sur {LM_API_URL}!")
+        if DETECTED_MODEL:
+            print(f"✅ Modèle détecté et prêt: {DETECTED_MODEL}")
+        return True
+    else:
         print("❌ Erreur: Impossible de se connecter à LM Studio. Vérifiez que le serveur est bien lancé.")
-        return False
-    except requests.exceptions.Timeout:
-        print("❌ Erreur: Timeout lors de la connexion à LM Studio.")
-        return False
-    except Exception as e:
-        print(f"❌ Erreur lors du test de connexion à LM Studio: {e}")
         return False
 
 print("=== Configuration chargée ===")
 print(f"TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:10]}..." if TELEGRAM_TOKEN else "TELEGRAM_TOKEN non défini")
 print(f"LM_API_URL: {LM_API_URL}" if LM_API_URL else "LM_API_URL non défini")
-print(f"LM_MODEL_NAME: {LM_MODEL_NAME}" if LM_MODEL_NAME else "LM_MODEL_NAME non défini")
 print("============================")
 
 # --- Variables globales ---
@@ -93,15 +304,280 @@ YOUTUBE_QUEUE = {}
 # --- Utilitaires ---
 
 def extract_video_id(url):
+    # Nettoyer l'URL d'abord
+    clean_url = url.split('$')[0].strip()
+    
     patterns = [
         r"(?:v=|\/)([0-9A-Za-z_-]{11})",
         r"youtu\.be\/([0-9A-Za-z_-]{11})"
     ]
     for pattern in patterns:
-        match = re.search(pattern, url)
+        match = re.search(pattern, clean_url)
         if match:
-            return match.group(1)
+            video_id = match.group(1)
+            # Nettoyer l'ID vidéo de tout caractère parasite
+            clean_video_id = re.sub(r'[^0-9A-Za-z_-]', '', video_id)[:11]
+            return clean_video_id
     return None
+
+def clean_subtitle_text(subtitle_content):
+    """Nettoie le contenu des sous-titres (XML, VTT, etc.) pour extraire le texte pur"""
+    try:
+        import re
+        import html
+        
+        print(f"🧹 Début du nettoyage des sous-titres ({len(subtitle_content)} caractères)")
+        
+        # Si c'est du XML (format YouTube)
+        if subtitle_content.strip().startswith('<?xml') or '<transcript>' in subtitle_content:
+            print("🧹 Nettoyage des sous-titres XML...")
+            # Extraire le texte entre les balises <text>
+            text_matches = re.findall(r'<text[^>]*>(.*?)</text>', subtitle_content, re.DOTALL)
+            if text_matches:
+                # Joindre tous les textes et nettoyer les entités HTML
+                full_text = ' '.join(text_matches)
+                # Décoder les entités HTML
+                full_text = html.unescape(full_text)
+                # Nettoyer les balises HTML restantes
+                full_text = re.sub(r'<[^>]+>', '', full_text)
+                # Nettoyer les espaces multiples
+                full_text = re.sub(r'\s+', ' ', full_text).strip()
+                print(f"✅ XML nettoyé: {len(full_text)} caractères")
+                return full_text
+        
+        # Si c'est du VTT
+        elif 'WEBVTT' in subtitle_content:
+            print("🧹 Nettoyage des sous-titres VTT...")
+            lines = subtitle_content.split('\n')
+            text_lines = []
+            for line in lines:
+                line = line.strip()
+                # Ignorer les lignes de timing et les métadonnées
+                if (line and 
+                    not line.startswith('WEBVTT') and 
+                    not '-->' in line and 
+                    not line.isdigit() and
+                    not line.startswith('NOTE') and
+                    not line.startswith('Kind:') and
+                    not line.startswith('Language:')):
+                    # Nettoyer les balises de formatage VTT
+                    line = re.sub(r'<[^>]+>', '', line)
+                    # Décoder les entités HTML
+                    line = html.unescape(line)
+                    if line.strip():
+                        text_lines.append(line)
+            
+            full_text = ' '.join(text_lines)
+            # Nettoyer les espaces multiples
+            full_text = re.sub(r'\s+', ' ', full_text).strip()
+            print(f"✅ VTT nettoyé: {len(full_text)} caractères")
+            return full_text
+        
+        # Si c'est déjà du texte pur, le nettoyer quand même
+        else:
+            print("🧹 Nettoyage du texte brut...")
+            
+            # Vérifier si c'est des métadonnées JSON (sous-titres automatiques)
+            if ('acAsrConf' in subtitle_content or 'tOffsetMs' in subtitle_content or 
+                'dDurationMs' in subtitle_content or 'tStartMs' in subtitle_content):
+                print("🚨 Métadonnées JSON détectées - extraction du texte parlé uniquement")
+                
+                # Essayer d'extraire le JSON et récupérer le texte
+                try:
+                    import json
+                    # Si c'est un array JSON
+                    if subtitle_content.strip().startswith('['):
+                        data = json.loads(subtitle_content)
+                        if isinstance(data, list):
+                            text_parts = []
+                            for item in data:
+                                # Chercher le texte dans différentes propriétés possibles
+                                if isinstance(item, dict):
+                                    for key in ['text', 'content', 'transcript', 'caption']:
+                                        if key in item and isinstance(item[key], str):
+                                            text_parts.append(item[key])
+                                            break
+                            if text_parts:
+                                cleaned_text = ' '.join(text_parts)
+                                print(f"✅ Texte extrait du JSON: {len(cleaned_text)} caractères")
+                                return cleaned_text
+                except:
+                    pass
+                
+                # Si l'extraction JSON échoue, filtrer manuellement les métadonnées
+                lines = subtitle_content.split('\n')
+                text_lines = []
+                for line in lines:
+                    line = line.strip()
+                    # Ignorer les lignes contenant des métadonnées
+                    if (line and 
+                        not 'acAsrConf' in line and
+                        not 'tOffsetMs' in line and 
+                        not 'dDurationMs' in line and
+                        not 'tStartMs' in line and
+                        not line.startswith('{') and
+                        not line.startswith('"ac') and
+                        not line.startswith('"t') and
+                        not line.startswith('"d') and
+                        not '":' in line and
+                        not line.endswith(',') and
+                        not line.endswith('}') and
+                        not line in ['{', '}', '[', ']']):
+                        # Nettoyer les guillemets et caractères JSON restants
+                        line = re.sub(r'^"([^"]*)"$', r'\1', line)  # Enlever guillemets autour
+                        line = line.replace('\\"', '"')  # Corriger les guillemets échappés
+                        if line and len(line) > 3:  # Ignorer les très courtes chaînes
+                            text_lines.append(line)
+                
+                cleaned_text = ' '.join(text_lines)
+                if cleaned_text:
+                    print(f"✅ Métadonnées filtrées: {len(cleaned_text)} caractères")
+                    return cleaned_text
+                else:
+                    print("❌ Impossible d'extraire le texte des métadonnées")
+                    return "Erreur: contenu principalement composé de métadonnées techniques"
+            
+            # Nettoyage standard pour les autres formats
+            # Décoder les entités HTML au cas où
+            cleaned_text = html.unescape(subtitle_content)
+            # Nettoyer les balises HTML
+            cleaned_text = re.sub(r'<[^>]+>', '', cleaned_text)
+            # Nettoyer les caractères de contrôle et les caractères non imprimables
+            cleaned_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned_text)
+            # Nettoyer les caractères Unicode problématiques
+            cleaned_text = re.sub(r'[^\w\s\.,;:!?\-\'\"()[\]{}]', ' ', cleaned_text)
+            # Nettoyer les espaces multiples
+            cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+            
+            # Vérifier si le texte semble corrompu (trop de caractères étranges)
+            if len(cleaned_text) > 0:
+                # Calculer le ratio de caractères alphabétiques
+                alpha_chars = sum(1 for c in cleaned_text if c.isalpha())
+                total_chars = len(cleaned_text.replace(' ', ''))
+                if total_chars > 0:
+                    alpha_ratio = alpha_chars / total_chars
+                    if alpha_ratio < 0.5:  # Moins de 50% de caractères alphabétiques
+                        print(f"⚠️ Texte possiblement corrompu (ratio alphabétique: {alpha_ratio:.2f})")
+                        print(f"Échantillon: {cleaned_text[:200]}...")
+            
+            print(f"✅ Texte brut nettoyé: {len(cleaned_text)} caractères")
+            return cleaned_text
+            
+    except Exception as e:
+        print(f"⚠️ Erreur lors du nettoyage des sous-titres: {e}")
+        return subtitle_content
+
+def get_subtitles_with_ytdlp(video_url):
+    """Méthode alternative pour récupérer les sous-titres avec yt-dlp"""
+    try:
+        print("🔄 Tentative de récupération des sous-titres avec yt-dlp...")
+        
+        ydl_opts = {
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['fr', 'en'],
+            'skip_download': True,
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            
+            # Chercher les sous-titres français d'abord
+            if 'subtitles' in info and info['subtitles']:
+                if 'fr' in info['subtitles']:
+                    print("🇫🇷 Sous-titres français trouvés avec yt-dlp")
+                    subtitle_url = info['subtitles']['fr'][0]['url']
+                    response = requests.get(subtitle_url)
+                    cleaned_text = clean_subtitle_text(response.text)
+                    return cleaned_text, None
+                elif 'en' in info['subtitles']:
+                    print("🇬🇧 Sous-titres anglais trouvés avec yt-dlp")
+                    subtitle_url = info['subtitles']['en'][0]['url']
+                    response = requests.get(subtitle_url)
+                    cleaned_text = clean_subtitle_text(response.text)
+                    return cleaned_text, None
+            
+            # Essayer les sous-titres automatiques
+            if 'automatic_captions' in info and info['automatic_captions']:
+                if 'fr' in info['automatic_captions']:
+                    print("🤖 Sous-titres automatiques français trouvés avec yt-dlp")
+                    subtitle_url = info['automatic_captions']['fr'][0]['url']
+                    response = requests.get(subtitle_url)
+                    cleaned_text = clean_subtitle_text(response.text)
+                    
+                    # Vérifier si le texte est vraiment en français ou si c'est de l'anglais étiqueté comme français
+                    if cleaned_text and len(cleaned_text) > 100:
+                        # Test simple : si beaucoup de mots anglais courants, c'est probablement de l'anglais
+                        english_words = ['the', 'and', 'that', 'this', 'with', 'for', 'are', 'was', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'his', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'she', 'use', 'her', 'how', 'oil', 'sit', 'set']
+                        text_lower = cleaned_text.lower()
+                        english_count = sum(1 for word in english_words if f' {word} ' in text_lower)
+                        
+                        if english_count > 20:  # Si beaucoup de mots anglais détectés
+                            print("🔍 Contenu détecté comme anglais malgré l'étiquette française - Traduction requise")
+                            return cleaned_text, "translate_needed"
+                    
+                    return cleaned_text, None
+                elif 'en' in info['automatic_captions']:
+                    print("🤖 Sous-titres automatiques anglais trouvés avec yt-dlp")
+                    subtitle_url = info['automatic_captions']['en'][0]['url']
+                    response = requests.get(subtitle_url)
+                    cleaned_text = clean_subtitle_text(response.text)
+                    return cleaned_text, "translate_needed"
+        
+        return None, "[Erreur] Aucun sous-titre trouvé avec yt-dlp"
+        
+    except Exception as e:
+        print(f"❌ Erreur avec yt-dlp: {str(e)}")
+        return None, f"[Erreur yt-dlp] {str(e)}"
+
+def translate_to_french(english_text):
+    """Traduit un texte anglais vers le français en utilisant LM Studio"""
+    try:
+        print(f"🔄 Traduction du texte anglais vers le français ({len(english_text)} caractères)...")
+        
+        # Pour les très longs textes, traduire par chunks
+        if len(english_text) > 15000:
+            print("📄 Texte très long - traduction par parties...")
+            chunks = split_text(english_text, 15000)
+            translated_chunks = []
+            
+            for i, chunk in enumerate(chunks):
+                print(f"   Traduction partie {i+1}/{len(chunks)}...")
+                messages = [
+                    {"role": "system", "content": "Tu es un traducteur professionnel. Traduis fidèlement ce texte anglais vers le français. Garde le sens et le style original. Ne traduis que le contenu, n'ajoute aucun commentaire."},
+                    {"role": "user", "content": f"Traduis ce texte en français :\n\n{chunk}"}
+                ]
+                
+                translated_chunk = chat_with_lmstudio(messages)
+                if not translated_chunk.startswith("[Erreur"):
+                    translated_chunks.append(translated_chunk)
+                else:
+                    print(f"⚠️ Erreur de traduction pour la partie {i+1}, conservation de l'original")
+                    translated_chunks.append(chunk)
+            
+            result = " ".join(translated_chunks)
+            print(f"✅ Traduction complète effectuée: {len(result)} caractères")
+            return result
+        else:
+            # Traduction directe pour les textes courts
+            messages = [
+                {"role": "system", "content": "Tu es un traducteur professionnel. Traduis fidèlement ce texte anglais vers le français. Garde le sens et le style original. Ne traduis que le contenu, n'ajoute aucun commentaire."},
+                {"role": "user", "content": f"Traduis ce texte en français :\n\n{english_text}"}
+            ]
+            
+            translated_text = chat_with_lmstudio(messages)
+            if not translated_text.startswith("[Erreur"):
+                print(f"✅ Traduction effectuée: {len(translated_text)} caractères")
+                return translated_text
+            else:
+                print(f"⚠️ Erreur de traduction, conservation du texte original")
+                return english_text
+                
+    except Exception as e:
+        print(f"❌ Erreur lors de la traduction: {str(e)}")
+        return english_text
 
 def get_subtitles(video_url):
     try:
@@ -109,25 +585,80 @@ def get_subtitles(video_url):
         if not video_id:
             return None, "[Erreur] Lien invalide ou ID introuvable."
 
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        print(f"🔍 Récupération des sous-titres pour la vidéo ID: {video_id}")
+        
+        # Nettoyer l'URL si elle contient des caractères parasites
+        clean_video_id = video_id.split('$')[0].split('&')[0].split('?')[0]
+        print(f"🧹 ID vidéo nettoyé: {clean_video_id}")
+        
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(clean_video_id)
+            print(f"📋 Transcriptions disponibles: {[t.language_code for t in transcript_list]}")
 
-        for transcript in transcript_list:
-            if transcript.language_code == "fr":
-                entries = transcript.fetch()
-                return " ".join([entry.text for entry in entries]), None
+            # Essayer d'abord le français
+            for transcript in transcript_list:
+                if transcript.language_code == "fr":
+                    print("🇫🇷 Utilisation des sous-titres français")
+                    entries = transcript.fetch()
+                    return " ".join([entry['text'] for entry in entries]), None
 
-        for transcript in transcript_list:
-            if transcript.is_translatable:
-                translated = transcript.translate('fr')
-                entries = translated.fetch()
-                return " ".join([entry.text for entry in entries]), None
+            # Ensuite essayer les sous-titres traduisibles
+            for transcript in transcript_list:
+                if transcript.is_translatable:
+                    print(f"🔄 Traduction depuis {transcript.language_code} vers le français")
+                    translated = transcript.translate('fr')
+                    entries = translated.fetch()
+                    return " ".join([entry['text'] for entry in entries]), None
+
+            # Si aucun sous-titre français ou traduisible, prendre le premier disponible
+            if transcript_list:
+                first_transcript = list(transcript_list)[0]
+                print(f"⚠️ Utilisation des sous-titres en {first_transcript.language_code} (non traduits)")
+                entries = first_transcript.fetch()
+                return " ".join([entry['text'] for entry in entries]), None
+
+        except Exception as transcript_error:
+            print(f"❌ Erreur avec YouTubeTranscriptApi: {str(transcript_error)}")
+            print("🔄 Tentative avec méthode alternative (yt-dlp)...")
+            
+            # Essayer la méthode alternative avec yt-dlp
+            subtitles, error = get_subtitles_with_ytdlp(video_url)
+            
+            # Si une traduction est nécessaire
+            if error == "translate_needed" and subtitles:
+                print("🌐 Traduction automatique du contenu anglais vers le français...")
+                translated_subtitles = translate_to_french(subtitles)
+                return translated_subtitles, None
+            
+            return subtitles, error
 
         return None, "[Erreur] Aucun sous-titre utilisable ou traduisible trouvé."
 
     except TranscriptsDisabled:
-        return None, "[Erreur] Les sous-titres sont désactivés pour cette vidéo."
+        print("⚠️ Sous-titres désactivés, tentative avec yt-dlp...")
+        subtitles, error = get_subtitles_with_ytdlp(video_url)
+        if error == "translate_needed" and subtitles:
+            print("🌐 Traduction automatique du contenu anglais vers le français...")
+            translated_subtitles = translate_to_french(subtitles)
+            return translated_subtitles, None
+        return subtitles, error
+    except NoTranscriptFound:
+        print("⚠️ Aucun sous-titre trouvé, tentative avec yt-dlp...")
+        subtitles, error = get_subtitles_with_ytdlp(video_url)
+        if error == "translate_needed" and subtitles:
+            print("🌐 Traduction automatique du contenu anglais vers le français...")
+            translated_subtitles = translate_to_french(subtitles)
+            return translated_subtitles, None
+        return subtitles, error
     except Exception as e:
-        return None, f"[Erreur récupération sous-titres] {str(e)}"
+        print(f"❌ Erreur détaillée lors de la récupération des sous-titres: {str(e)}")
+        print("🔄 Tentative avec méthode alternative (yt-dlp)...")
+        subtitles, error = get_subtitles_with_ytdlp(video_url)
+        if error == "translate_needed" and subtitles:
+            print("🌐 Traduction automatique du contenu anglais vers le français...")
+            translated_subtitles = translate_to_french(subtitles)
+            return translated_subtitles, None
+        return subtitles, error
 
 def split_text(text, max_chars=6000):
     """
@@ -150,7 +681,7 @@ def split_text(text, max_chars=6000):
     estimated_tokens = len(text) / 4
     
     # Si le texte est très long (dépasse la limite de contexte du modèle), réduire encore plus la taille
-    context_limit = int(os.getenv("LM_CONTEXT_LENGTH", "4096"))
+    context_limit = DETECTED_CONTEXT_LENGTH if DETECTED_CONTEXT_LENGTH else int(os.getenv("LM_CONTEXT_LENGTH", "4096"))
     if estimated_tokens > context_limit:
         # Calculer un facteur de réduction pour respecter la limite de contexte
         # Utiliser 75% de la limite pour laisser de la place aux instructions et à la réponse
@@ -201,8 +732,13 @@ def chat_with_lmstudio(messages):
         if not LM_API_URL:
             return "[Erreur] Variable d'environnement LM_API_URL non définie dans le fichier .env"
         
-        if not LM_MODEL_NAME:
-            return "[Erreur] Variable d'environnement LM_MODEL_NAME non définie dans le fichier .env"
+        # Détecter automatiquement le modèle si pas encore fait
+        if not DETECTED_MODEL:
+            if not detect_available_model():
+                return "[Erreur] Impossible de détecter un modèle disponible dans LM Studio. Vérifiez qu'un modèle est chargé."
+        
+        # Ne pas re-tester la connexion si le modèle est déjà détecté
+        # (évite la re-détection en boucle)
         
         # S'assurer que l'URL se termine par /v1/chat/completions
         api_url = LM_API_URL.rstrip('/')
@@ -227,11 +763,14 @@ def chat_with_lmstudio(messages):
             return "[Erreur] Aucun message valide à envoyer"
         
         # Format de requête compatible avec LM Studio (API OpenAI)
+        # Utiliser les paramètres détectés automatiquement
+        max_tokens = DETECTED_MAX_TOKENS if DETECTED_MAX_TOKENS else int(os.getenv("LM_MAX_TOKENS", "500"))
+        
         payload = {
-            "model": LM_MODEL_NAME,  # Spécifier explicitement le modèle
+            "model": DETECTED_MODEL,  # Utiliser le modèle détecté automatiquement
             "messages": formatted_messages,
             "temperature": float(os.getenv("LM_TEMPERATURE", "0.7")),
-            "max_tokens": int(os.getenv("LM_MAX_TOKENS", "2000")),
+            "max_tokens": max_tokens,
             "stream": False
         }
 
@@ -272,16 +811,17 @@ def chat_with_lmstudio(messages):
 
 def summarize(text):
     try:
-        # Diviser le texte en chunks plus petits pour une meilleure fiabilité
-        max_chunk_size = int(os.getenv("LM_CHUNK_SIZE", "6000"))  # Réduit de 12000 à 6000
+        # Diviser le texte en chunks adaptatifs basés sur la configuration détectée
+        max_chunk_size = get_adaptive_chunk_size()
         chunks = split_text(text, max_chunk_size)
         summaries = []
 
         prompt = (
-            "Fais un résumé du contenu en apportant un maximum de valeur au lecteur. "
-            "Commence par un titre accrocheur qui résume le sujet principal, suivi d'un tiret. "
-            "Utilise des points clairs, sans répétition, et mets en avant les idées clés. "
-            "N'utilise pas de formatage Markdown comme les astérisques, les crochets ou autres caractères spéciaux."
+            "Fais un résumé du contenu en français en apportant un maximum de valeur au lecteur. "
+            "Commence par un titre accrocheur en français qui résume le sujet principal, suivi d'un tiret. "
+            "Utilise des points clairs en français, sans répétition, et mets en avant les idées clés. "
+            "N'utilise pas de formatage Markdown comme les astérisques, les crochets ou autres caractères spéciaux. "
+            "IMPORTANT: Réponds uniquement en français, même si le contenu source était en anglais."
         )
 
         print(f"Traitement de {len(chunks)} chunks pour résumé...")
@@ -309,7 +849,7 @@ def summarize(text):
                         print(f"Erreur lors du résumé du chunk {i+1}: {chunk_summary}")
                         # En cas d'erreur, simplifier la demande pour ce chunk
                         simplified_messages = [
-                            {"role": "system", "content": "Résume ce texte simplement sans formatage, en quelques phrases clés."},
+                            {"role": "system", "content": "Résume ce texte en français simplement sans formatage, en quelques phrases clés."},
                             {"role": "user", "content": chunk[:len(chunk) // 2]}  # Utiliser moitié moins de texte
                         ]
                         chunk_summary = chat_with_lmstudio(simplified_messages)
@@ -333,7 +873,7 @@ def summarize(text):
                 batch_text = "\n\n".join([f"Section {i+j+1}: {summary}" for j, summary in enumerate(batch)])
                 
                 fusion_message = [
-                    {"role": "system", "content": "Fusionne ces résumés partiels en un seul résumé cohérent sans formatage. Garde les points clés principaux uniquement."},
+                    {"role": "system", "content": "Fusionne ces résumés partiels en un seul résumé cohérent en français sans formatage. Garde les points clés principaux uniquement. Réponds uniquement en français."},
                     {"role": "user", "content": batch_text}
                 ]
                 
@@ -373,7 +913,7 @@ def summarize(text):
                         print(f"Erreur lors du résumé du chunk {i+1}: {chunk_summary}")
                         # En cas d'erreur, simplifier la demande pour ce chunk
                         simplified_messages = [
-                            {"role": "system", "content": "Résume ce texte simplement sans formatage, en commençant par un titre suivi d'un tiret."},
+                            {"role": "system", "content": "Résume ce texte en français simplement sans formatage, en commençant par un titre suivi d'un tiret. Réponds uniquement en français."},
                             {"role": "user", "content": chunk[:max_chunk_size // 2]}  # Utiliser moitié moins de texte
                         ]
                         chunk_summary = chat_with_lmstudio(simplified_messages)
@@ -432,7 +972,12 @@ def summarize(text):
         if final_summary.startswith("[Erreur"):
             print(f"Erreur lors de la fusion finale: {final_summary}")
             concatenated = "\n\n".join([f"Partie {i+1}:\n{summary}" for i, summary in enumerate(summaries)])
-            return sanitize_markdown(concatenated)
+            final_summary = sanitize_markdown(concatenated)
+        
+        # Vérification finale : s'assurer que le résumé n'est pas vide
+        if not final_summary or not final_summary.strip():
+            print("⚠️ Résumé final vide, création d'un résumé de secours")
+            final_summary = "Résumé de la vidéo - Le contenu a été traité mais le résumé détaillé n'a pas pu être généré correctement."
             
         return final_summary
     except Exception as e:
@@ -441,6 +986,14 @@ def summarize(text):
         return error_msg
 
 def ask_question_about_subtitles(subtitles, question):
+    # Limiter la taille des sous-titres en utilisant la configuration adaptative
+    max_subtitle_length = get_adaptive_chunk_size()
+    
+    if len(subtitles) > max_subtitle_length:
+        # Tronquer les sous-titres si trop longs
+        subtitles = subtitles[:max_subtitle_length] + "... [texte tronqué]"
+        print(f"⚠️ Sous-titres tronqués à {max_subtitle_length} caractères pour éviter le dépassement de contexte")
+    
     prompt = (
         f"Voici la transcription d'une vidéo YouTube :\n\n{subtitles}\n\n"
         f"Réponds à la question suivante de manière claire et utile : {question}"
@@ -598,13 +1151,36 @@ def text_to_audio(text, filename="resume.mp3"):
     Convertit le texte en fichier audio MP3.
     Nettoie le texte avant de le convertir pour éviter les problèmes de prononciation.
     """
+    # Vérifier si le texte d'entrée est valide
+    if not text or not text.strip():
+        print("⚠️ Texte vide fourni à text_to_audio")
+        raise ValueError("No text to send to TTS API")
+    
+    print(f"🔊 Conversion en audio du texte ({len(text)} caractères)")
+    
     # Nettoyer le texte pour la synthèse vocale
     clean_text = clean_text_for_audio(text)
     
+    # Vérifier si le texte nettoyé est encore valide
+    if not clean_text or not clean_text.strip():
+        print("⚠️ Texte vide après nettoyage pour l'audio")
+        print(f"Texte original: {text[:200]}...")
+        # Utiliser le texte original si le nettoyage a tout supprimé
+        clean_text = text.strip()
+        if not clean_text:
+            raise ValueError("No text to send to TTS API")
+    
+    print(f"🧹 Texte nettoyé pour l'audio ({len(clean_text)} caractères)")
+    
     # Convertir en audio
-    tts = gTTS(clean_text, lang='fr')
-    tts.save(filename)
-    return filename
+    try:
+        tts = gTTS(clean_text, lang='fr')
+        tts.save(filename)
+        print(f"✅ Audio sauvegardé dans {filename}")
+        return filename
+    except Exception as e:
+        print(f"❌ Erreur lors de la conversion TTS: {e}")
+        raise
 
 # --- Gestion des abonnements ---
 
@@ -1151,32 +1727,49 @@ async def process_youtube_queue(chat_id, context):
         await asyncio.sleep(4)
         
         # Créer et envoyer l'audio
-        audio_path = text_to_audio(summary, f"resume_queue.mp3")
-        
         try:
-            with open(audio_path, 'rb') as audio_file:
-                if thread_id:
-                    await context.bot.send_voice(
-                        chat_id=chat_id,
-                        message_thread_id=thread_id,
-                        voice=audio_file,
-                        caption=f"🎙️ Résumé audio"
-                    )
-                else:
-                    await context.bot.send_voice(
-                        chat_id=chat_id,
-                        voice=audio_file,
-                        caption=f"🎙️ Résumé audio"
-                    )
+            audio_path = text_to_audio(summary, f"resume_queue.mp3")
+            
+            try:
+                with open(audio_path, 'rb') as audio_file:
+                    if thread_id:
+                        await context.bot.send_voice(
+                            chat_id=chat_id,
+                            message_thread_id=thread_id,
+                            voice=audio_file,
+                            caption=f"🎙️ Résumé audio"
+                        )
+                    else:
+                        await context.bot.send_voice(
+                            chat_id=chat_id,
+                            voice=audio_file,
+                            caption=f"🎙️ Résumé audio"
+                        )
+            except Exception as e:
+                await context.bot.send_message(
+                    text=f"⚠️ Erreur lors de l'envoi de l'audio: {str(e)}",
+                    **reply_params
+                )
+            finally:
+                # Supprimer le fichier audio
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+                    
+        except ValueError as ve:
+            if "No text to send to TTS API" in str(ve):
+                print(f"⚠️ Résumé vide pour l'audio, pas de fichier audio généré pour {url}")
+                await context.bot.send_message(
+                    text="⚠️ Le résumé textuel a été généré mais la conversion audio n'a pas pu être effectuée (contenu vide après nettoyage).",
+                    **reply_params
+                )
+            else:
+                raise ve
         except Exception as e:
+            print(f"❌ Erreur lors de la création de l'audio: {str(e)}")
             await context.bot.send_message(
-                text=f"⚠️ Erreur lors de l'envoi de l'audio: {str(e)}",
+                text=f"⚠️ Erreur lors de la création de l'audio: {str(e)}",
                 **reply_params
             )
-        finally:
-            # Supprimer le fichier audio
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
     
     except Exception as e:
         # En cas d'erreur, informer l'utilisateur
@@ -1615,10 +2208,6 @@ if __name__ == '__main__':
     if not LM_API_URL:
         print("❌ ERREUR: URL de l'API LM non définie dans le fichier .env")
         config_ok = False
-    
-    if not LM_MODEL_NAME:
-        print("❌ ERREUR: Nom du modèle LM non défini dans le fichier .env")
-        config_ok = False
         
     if not config_ok:
         print("\n⚠️ Le bot peut ne pas fonctionner correctement en raison de problèmes de configuration.")
@@ -1648,9 +2237,9 @@ if __name__ == '__main__':
         print("Le bot va démarrer, mais les fonctionnalités liées à LM Studio ne fonctionneront pas correctement.")
         print("Veuillez vérifier que:")
         print("1. LM Studio est bien lancé sur votre ordinateur")
-        print("2. L'API REST est activée dans les options de LM Studio")
+        print("2. L'API REST est activée dans les options de LM Studio") 
         print("3. L'URL dans votre fichier .env correspond à l'URL affichée dans LM Studio")
-        print("4. Le nom du modèle dans votre fichier .env correspond à un modèle chargé dans LM Studio")
+        print("4. Un modèle est bien chargé dans LM Studio")
         print("\nAppuyez sur Ctrl+C pour arrêter le bot, ou attendez pour démarrer sans LM Studio...\n")
         time.sleep(5)
     else:
@@ -1659,17 +2248,10 @@ if __name__ == '__main__':
     # Charger les abonnements existants
     load_subscriptions()
     
-    # Créer l'application avec des paramètres optimisés pour les groupes
-    builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
+    # Créer l'application avec une configuration simplifiée et protection contre les conflits
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    # Configurer des timeouts plus longs
-    builder.connection_pool_size(8)
-    builder.connect_timeout(30.0)
-    builder.read_timeout(30.0)
-    builder.write_timeout(30.0)
-    
-    # Construire l'application
-    app = builder.build()
+    # Note: Le nettoyage des webhooks se fera automatiquement au démarrage du polling
     
     # Afficher un message pour confirmer le bon démarrage
     print("\n=== DÉMARRAGE DU BOT ===")
@@ -1714,18 +2296,22 @@ if __name__ == '__main__':
     else:
         print("⚠️ Planificateur non disponible, vérification automatique désactivée")
     
-    # Information importante sur la configuration des groupes
-    print("\n=== INFORMATION IMPORTANTE ===")
-    print("Pour que le bot fonctionne correctement dans les groupes :")
-    print("1. Ajoutez le bot comme administrateur du groupe")
-    print("   OU")
-    print("2. Désactivez le mode Privacy via @BotFather :")
-    print("   /mybots > [votre bot] > Bot Settings > Group Privacy > Turn off")
-    print("\nCommandes disponibles : /start, /help, /yt")
-    print("==============================\n")
+
     
     # Démarrage du bot
     print("🚀 Bot démarré ! Utilisez Ctrl+C pour arrêter.")
     
+    # Attendre quelques secondes pour éviter les conflits avec d'anciennes instances
+    print("⏳ Attente de 3 secondes pour éviter les conflits...")
+    time.sleep(3)
+    
     # Activer tous les types de mises à jour pour une meilleure compatibilité
-    app.run_polling(allowed_updates=telegram.Update.ALL_TYPES)
+    try:
+        print("🔄 Démarrage du polling...")
+        app.run_polling(allowed_updates=telegram.Update.ALL_TYPES)
+    except telegram.error.Conflict as e:
+        print(f"❌ Conflit détecté: {e}")
+        print("⏳ Attente de 10 secondes pour résoudre le conflit...")
+        time.sleep(10)
+        print("🔄 Nouvelle tentative de démarrage...")
+        app.run_polling(allowed_updates=telegram.Update.ALL_TYPES)

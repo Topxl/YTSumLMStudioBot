@@ -17,7 +17,7 @@ IF NOT EXIST .env (
         copy .env.example .env
         echo Fichier .env cree avec succes.
         echo Veuillez editer ce fichier pour configurer vos variables d'environnement.
-        echo N'oubliez pas de definir TELEGRAM_BOT_TOKEN, LM_API_URL et LM_MODEL_NAME.
+        echo N'oubliez pas de definir TELEGRAM_BOT_TOKEN et LM_API_URL.
         notepad .env
         pause
         exit /b
